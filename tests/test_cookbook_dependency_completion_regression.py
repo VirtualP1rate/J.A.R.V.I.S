@@ -32,7 +32,7 @@ def test_local_windows_session_commands_use_local_powershell_log_dir():
     source = _read("static/js/cookbookRunning.js")
 
     assert "const host = task.remoteHost;" in source
-    assert "host ? '$env:TEMP\\\\odysseus-sessions' : '$env:TEMP\\\\odysseus-tmux'" in source
+    assert "host ? '$env:TEMP\\\\jarvis-sessions' : '$env:TEMP\\\\jarvis-tmux'" in source
     assert "return host ? `ssh ${pf}${host}" in source
     assert ": `powershell -Command \"${ps}\"`;" in source
 

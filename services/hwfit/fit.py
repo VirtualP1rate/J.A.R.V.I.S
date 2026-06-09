@@ -591,7 +591,7 @@ def rank_models(system, use_case=None, limit=50, search=None, sort="score", quan
     for m in models:
         native_q = _native_quant(m)
 
-        # MLX needs the mlx_lm runtime, which Odysseus does not generate serve
+        # MLX needs the mlx_lm runtime, which J.A.R.V.I.S does not generate serve
         # commands for. Hide it on every backend, including Metal.
         if native_q.startswith("mlx-") or "mlx" in (m.get("name") or "").lower():
             continue
@@ -599,7 +599,7 @@ def rank_models(system, use_case=None, limit=50, search=None, sort="score", quan
         # ROCm support for vLLM/SGLang quantized safetensors is too brittle to
         # recommend blindly in the default scan. Keep AWQ/GPTQ/FP8 discoverable
         # only when the user explicitly picks that format from the quant filter;
-        # otherwise prefer GGUF/Q* entries that Odysseus can route through
+        # otherwise prefer GGUF/Q* entries that J.A.R.V.I.S can route through
         # llama.cpp/Ollama without pretending "fits VRAM" means "servable".
         if rocm and is_prequantized(m) and not filter_native:
             continue
@@ -617,7 +617,7 @@ def rank_models(system, use_case=None, limit=50, search=None, sort="score", quan
         # Otherwise the Cookbook rates vLLM-only AWQ/GPTQ builds "GOOD" on a
         # Radeon that can't actually serve them.
         #
-        # Windows is the same: Odysseus only supports llama.cpp on Windows,
+        # Windows is the same: J.A.R.V.I.S only supports llama.cpp on Windows,
         # which requires GGUF. vLLM/SGLang are explicitly blocked, so AWQ/GPTQ
         # models without a GGUF source are unservable there.
         if (apple_silicon or consumer_amd or is_windows) and not (m.get("is_gguf") or m.get("gguf_sources")):

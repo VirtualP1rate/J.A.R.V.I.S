@@ -27,7 +27,7 @@ def _load_mail_cli(monkeypatch):
     monkeypatch.setitem(sys.modules, "core", core_mod)
     monkeypatch.setitem(sys.modules, "core.database", database_mod)
 
-    return load_script("odysseus-mail")
+    return load_script("jarvis-mail")
 
 
 def test_recipient_list_trims_to_cc_and_bcc(monkeypatch):

@@ -12,7 +12,7 @@ def _load_sessions_cli(monkeypatch):
     database_mod.Session = object
     monkeypatch.setitem(sys.modules, "core", core_mod)
     monkeypatch.setitem(sys.modules, "core.database", database_mod)
-    return load_script("odysseus-sessions")
+    return load_script("jarvis-sessions")
 
 
 def test_serialize_normalizes_numeric_counters(monkeypatch):

@@ -42,7 +42,7 @@ module.exports = async ({ github, context, core }) => {
 
     case 'bug': {
       if (!section('Install Method')) {
-        failures.push('**Install Method** — select how you installed Odysseus');
+        failures.push('**Install Method** — select how you installed J.A.R.V.I.S');
       }
 
       if (!section('Operating System')) {

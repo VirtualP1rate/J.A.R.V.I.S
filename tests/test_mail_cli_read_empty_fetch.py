@@ -45,7 +45,7 @@ def _load_mail_cli(monkeypatch):
     monkeypatch.setitem(sys.modules, "routes.email_pollers", pollers)
     monkeypatch.setitem(sys.modules, "core", core_mod)
     monkeypatch.setitem(sys.modules, "core.database", database_mod)
-    return load_script("odysseus-mail")
+    return load_script("jarvis-mail")
 
 
 def test_cmd_read_handles_empty_fetch_payload(monkeypatch):
