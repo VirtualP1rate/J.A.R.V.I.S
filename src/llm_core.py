@@ -270,7 +270,10 @@ def _is_ollama_native_url(url: str) -> bool:
     path = (parsed.path or "").rstrip("/")
     if _host_match(url, "ollama.com"):
         return True
-    if path.startswith("/v1"):
+    # OpenAI-compatible paths are never native Ollama. Ollama's own OpenAI shim
+    # lives at /v1; servers like lemonade-sdk expose theirs at /api/v1 (and can
+    # share Ollama's 11434 port), so exempt both before the port/host heuristic.
+    if path.startswith("/v1") or path.startswith("/api/v1"):
         return False
     local_ollama_host = host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or parsed.port == 11434
     return local_ollama_host and (path == "" or path == "/api" or path.startswith("/api/"))
