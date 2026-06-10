@@ -12,6 +12,16 @@ class AITTSManager {
         this._provider = 'disabled';
         this.autoPlay = false;
         this.cache = new Map(); // Client-side audio cache
+        this._inflight = new Map(); // cacheKey -> in-flight synthesize() promise (dedupe + prefetch)
+
+        // Web Audio analyser for voice-reactive visuals (lazily created on first
+        // server-TTS playback). Lets the background "core" animation pulse to the
+        // actual voice waveform via getAudioLevel(). Browser speechSynthesis has
+        // no tappable stream, so getAudioLevel() returns 0 on that path.
+        this._audioCtx = null;
+        this._analyser = null;
+        this._levelData = null;
+        this._sourced = new WeakSet(); // audio elements already routed (source once each)
 
         // Queue for sequential auto-play
         this._queue = [];       // Array of { text, button, resetFn }
@@ -141,8 +151,13 @@ class AITTSManager {
         if (this.cache.has(cacheKey)) {
             return this.cache.get(cacheKey);
         }
+        // Share an in-flight request so a prefetch and the real playback call
+        // for the same text don't synthesize twice.
+        if (this._inflight.has(cacheKey)) {
+            return this._inflight.get(cacheKey);
+        }
 
-        try {
+        const promise = (async () => {
             if (onProgress) onProgress('synthesizing');
 
             const response = await fetch('/api/tts/synthesize', {
@@ -170,11 +185,29 @@ class AITTSManager {
             if (onProgress) onProgress('complete');
 
             return audioUrl;
+        })();
 
+        this._inflight.set(cacheKey, promise);
+        try {
+            return await promise;
         } catch (error) {
             if (onProgress) onProgress('error');
             throw error;
+        } finally {
+            this._inflight.delete(cacheKey);
         }
+    }
+
+    /**
+     * Warm the cache for upcoming queued sentences without blocking. Synthesis
+     * runs on the server while the current clip plays on the client, so the next
+     * sentence's audio is usually ready by the time this one ends — eliminating
+     * the gap that otherwise makes playback stutter ("speak a few words, pause,
+     * speak more"). Fire-and-forget; errors surface when the item actually plays.
+     */
+    _prefetch(text) {
+        if (!text || this.useBrowserTTS || !this.available) return;
+        this.synthesize(text).catch(() => {});
     }
 
     _findBrowserVoice() {
@@ -232,6 +265,51 @@ class AITTSManager {
             window.speechSynthesis.speak(utterance);
             this.isPlaying = true;
         });
+    }
+
+    /**
+     * Route an <audio> element through a shared AnalyserNode so getAudioLevel()
+     * can report the live voice amplitude. Each element can only be sourced once
+     * (createMediaElementAudioSource throws otherwise), and the analyser is wired
+     * to the context destination so playback stays audible. Best-effort: any
+     * failure (no Web Audio, autoplay policy, etc.) is swallowed and playback
+     * continues unaffected — visuals simply fall back to the isPlaying flag.
+     */
+    _routeToAnalyser(audio) {
+        try {
+            const AC = window.AudioContext || window.webkitAudioContext;
+            if (!AC) return;
+            if (!this._audioCtx) {
+                this._audioCtx = new AC();
+                this._analyser = this._audioCtx.createAnalyser();
+                this._analyser.fftSize = 256;
+                this._analyser.connect(this._audioCtx.destination);
+                this._levelData = new Uint8Array(this._analyser.fftSize);
+            }
+            if (this._audioCtx.state === 'suspended') this._audioCtx.resume();
+            if (this._sourced.has(audio)) return;
+            const src = this._audioCtx.createMediaElementSource(audio);
+            src.connect(this._analyser);
+            this._sourced.add(audio);
+        } catch (_e) {
+            // Web Audio unavailable / element already sourced — ignore.
+        }
+    }
+
+    /**
+     * Current voice amplitude as RMS in 0..1, for voice-reactive visuals.
+     * Returns 0 when not playing server TTS or when no analyser is wired
+     * (e.g. the browser speechSynthesis path).
+     */
+    getAudioLevel() {
+        if (!this.isPlaying || !this._analyser || !this._levelData) return 0;
+        this._analyser.getByteTimeDomainData(this._levelData);
+        let sum = 0;
+        for (let i = 0; i < this._levelData.length; i++) {
+            const v = (this._levelData[i] - 128) / 128; // center on 0
+            sum += v * v;
+        }
+        return Math.sqrt(sum / this._levelData.length);
     }
 
     stop() {
@@ -310,6 +388,11 @@ class AITTSManager {
 
             if (!this._processing) return;
 
+            // Prefetch the next queued sentence's audio so its synthesis overlaps
+            // this clip's playback instead of stalling between sentences.
+            const next = this._queue[1];
+            if (next) this._prefetch(next.text);
+
             button.innerHTML = ICON_STOP;
             button.classList.remove('loading');
             button.classList.add('playing');
@@ -330,6 +413,7 @@ class AITTSManager {
                         audio.playbackRate = this.playbackSpeed;
                     }
                     this.currentAudio = audio;
+                    this._routeToAnalyser(audio);
                     audio.onended = () => {
                         this.isPlaying = false;
                         if (this.currentAudio === audio) this.currentAudio = null;

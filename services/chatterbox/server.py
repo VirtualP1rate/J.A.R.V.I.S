@@ -47,7 +47,10 @@ MAX_CHARS = int(os.getenv("MAX_CHARS", "5000"))
 CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "600"))
 _AUDIO_EXTS = (".wav", ".mp3", ".flac", ".ogg", ".m4a")
 
-_STATE: Dict[str, object] = {"model": None, "ready": False, "variant": None}
+# cond_key identifies the voice conditionals currently baked into the model
+# (variant, reference-clip path, exaggeration). While it matches a request we
+# reuse model.conds instead of re-cloning the voice on every call.
+_STATE: Dict[str, object] = {"model": None, "ready": False, "variant": None, "cond_key": None}
 # Serializes synthesis and model reloads: the model is not safe for concurrent
 # use, and a variant hot-swap must run exclusively (free old -> load new).
 _MODEL_LOCK = threading.Lock()
@@ -71,6 +74,7 @@ def _load_model(variant: str):
     model = _Model.from_pretrained(device=device)
     _STATE["model"] = model
     _STATE["variant"] = variant
+    _STATE["cond_key"] = None  # fresh model has no baked-in voice conditionals
     logger.info("Chatterbox ready (variant=%s, sr=%s).", variant, getattr(model, "sr", "?"))
     return model
 
@@ -183,9 +187,7 @@ def _synthesize(req: SpeechRequest) -> bytes:
     cfg_weight = req.cfg_weight if req.cfg_weight is not None else DEFAULT_CFG_WEIGHT
 
     gen_kwargs = {"exaggeration": exaggeration, "cfg_weight": cfg_weight}
-    if ref is not None:
-        gen_kwargs["audio_prompt_path"] = str(ref)
-    else:
+    if ref is None:
         logger.warning("No reference clip found in %s; using Chatterbox default voice.", VOICES_DIR)
 
     chunks = _split_text(text)
@@ -198,6 +200,15 @@ def _synthesize(req: SpeechRequest) -> bytes:
         model = _STATE["model"]
         if model is None:
             raise HTTPException(status_code=503, detail="model not loaded")
+        # Voice conditioning is expensive, so bake it into the model once per
+        # (variant, clip, exaggeration) and reuse it. generate() falls back to
+        # the cached model.conds whenever audio_prompt_path is omitted — which is
+        # exactly what generate(audio_prompt_path=ref) would recompute every call.
+        if ref is not None:
+            key = (_STATE.get("variant"), str(ref), round(exaggeration, 3))
+            if _STATE.get("cond_key") != key:
+                model.prepare_conditionals(str(ref), exaggeration=exaggeration)
+                _STATE["cond_key"] = key
         pieces = []
         for chunk in chunks:
             with torch.no_grad():
