@@ -89,3 +89,6 @@ docs/windows-port/
 compound.config.json
 *.error.log
 _scratch/
+
+# graphify knowledge-graph output (generated tooling artifact, ~29MB)
+graphify-out/
