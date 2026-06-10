@@ -311,30 +311,6 @@ def translate_path(path_str: str) -> str:
         return path_str
 
 
-def get_wsl_windows_user_profile() -> Optional[str]:
-    """Retrieve the Windows host User Profile path from inside WSL."""
-    if not is_wsl():
-        return None
-    try:
-        r = run_wsl_windows_powershell("Write-Output $env:USERPROFILE", timeout=5)
-        if r.returncode == 0 and r.stdout.strip():
-            return translate_path(r.stdout.strip())
-    except Exception:
-        pass
-
-    try:
-        users_dir = "/mnt/c/Users"
-        if os.path.isdir(users_dir):
-            for entry in os.listdir(users_dir):
-                if entry not in ("All Users", "Default", "Default User", "desktop.ini", "Public"):
-                    path = os.path.join(users_dir, entry)
-                    if os.path.isdir(path):
-                        return path
-    except Exception:
-        pass
-    return None
-
-
 def _ssh_exec_argv(
     remote: str,
     ssh_port: str | None,
