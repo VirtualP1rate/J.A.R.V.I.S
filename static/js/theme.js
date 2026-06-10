@@ -388,10 +388,10 @@ export function applyFontDensity(font, density) {
 const _BG_CLASSES = ['bg-pattern-dots',
   'bg-pattern-synapse', 'bg-pattern-rain', 'bg-pattern-constellations',
   'bg-pattern-perlin-flow',
-  'bg-pattern-petals', 'bg-pattern-sparkles', 'bg-pattern-embers'];
+  'bg-pattern-petals', 'bg-pattern-sparkles', 'bg-pattern-embers', 'bg-pattern-core'];
 const _CANVAS_PATTERNS = { synapse: _initSynapse, rain: _initRain, constellations: _initConstellations,
   'perlin-flow': _initPerlinFlow,
-  petals: _initPetals, sparkles: _initSparkles, embers: _initEmbers };
+  petals: _initPetals, sparkles: _initSparkles, embers: _initEmbers, core: _initCore };
 
 export function applyBgEffectColor(color) {
   document.documentElement.style.setProperty('--bg-effect-color', color || '');
@@ -429,7 +429,7 @@ export function applyBgPattern(pattern) {
   const p = pattern || 'none';
   document.body.classList.remove(..._BG_CLASSES);
   // Clean up any canvas backgrounds
-  document.querySelectorAll('#synapse-canvas, #rain-canvas, #constellations-canvas, #perlin-flow-canvas, #petals-canvas, #sparkles-canvas, #embers-canvas').forEach(c => c.remove());
+  document.querySelectorAll('#synapse-canvas, #rain-canvas, #constellations-canvas, #perlin-flow-canvas, #petals-canvas, #sparkles-canvas, #embers-canvas, #core-canvas').forEach(c => c.remove());
   if (p !== 'none') document.body.classList.add('bg-pattern-' + p);
   if (_CANVAS_PATTERNS[p]) _CANVAS_PATTERNS[p]();
   // Hide sliders that do nothing on static patterns.
@@ -2038,6 +2038,196 @@ function _initEmbers() {
       }
     }
     ctx.globalCompositeOperation = 'source-over';
+  }
+  draw();
+}
+
+// ── Core — a holographic "JARVIS orb" that reacts to JARVIS's voice ──
+// A translucent teal energy sphere (modelled on the JARVIS app): an undulating
+// membrane of wavy concentric rim rings (radius perturbed by harmonics + Perlin
+// noise, vertically squashed so it reads as a tilted 3D orb), soft concentric
+// ripples expanding through it, and a slowly-rotating inner sphere of dots
+// placed on the Fibonacci lattice (even coverage) linked by a faint lattice —
+// all drawn with additive blending over a soft core glow. It breathes when idle
+// and surges (bigger, brighter, faster ripples) in time with TTS: it reads
+// window.aiTTSManager.getAudioLevel() (real audio RMS, 0..1) when available,
+// falling back to the boolean isPlaying flag when no stream is tappable (e.g.
+// the browser speechSynthesis path). Refs: Fibonacci sphere
+// (extremelearning.com.au), additive-blend particle glow (hakimel/Sphere).
+function _initCore() {
+  if (document.getElementById('core-canvas')) return;
+  const canvas = document.createElement('canvas');
+  canvas.id = 'core-canvas';
+  canvas.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:0;';
+  // Decorative background effect — hide from assistive tech so screen readers
+  // don't announce an empty canvas and axe's "region" rule doesn't flag it.
+  canvas.setAttribute('aria-hidden', 'true');
+  document.body.prepend(canvas);
+  const ctx = canvas.getContext('2d');
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const TAU = Math.PI * 2;
+  const SQUASH = 0.68;       // vertical squash → the orb reads as a tilted disc
+  const GOLDEN = Math.PI * (3 - Math.sqrt(5)); // golden angle ≈ 2.39996 rad
+  let W, H, cx, cy, baseR, t = 0, energy = 0;
+  let nodes = [];            // inner dotted sphere (Fibonacci lattice unit vecs)
+  const ripples = [];        // expanding membrane ripples { life, maxLife }
+  let rippleTimer = 10;
+
+  function buildNodes() {
+    const N = W < 760 ? 64 : 92;
+    nodes = [];
+    for (let i = 0; i < N; i++) {
+      const by = 1 - (i / (N - 1)) * 2;            // y from +1 → -1
+      const rr = Math.sqrt(Math.max(0, 1 - by * by));
+      const th = GOLDEN * i;
+      nodes.push({ bx: Math.cos(th) * rr, by, bz: Math.sin(th) * rr,
+                   x: 0, y: 0, depth: 0 });
+    }
+  }
+  function resize() {
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    cx = W / 2; cy = H / 2;
+    baseR = Math.min(W, H) * 0.24;
+    buildNodes();
+  }
+  resize();
+  const _onResize = () => resize();
+  window.addEventListener('resize', _onResize);
+
+  function getColor() {
+    const s = getComputedStyle(document.documentElement);
+    return s.getPropertyValue('--bg-effect-color').trim() || s.getPropertyValue('--fg').trim() || '#9cdef2';
+  }
+  function getIntensity() {
+    const v = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--bg-effect-intensity'));
+    return isNaN(v) ? 1 : v;
+  }
+  let _rgbCache = '', _rgb = { r: 156, g: 222, b: 242 };
+  function rgbOf(hex) {
+    if (hex !== _rgbCache) { _rgbCache = hex; _rgb = hexToRgb(hex) || _rgb; }
+    return _rgb;
+  }
+  // Live voice level: real audio RMS when tappable, else a synthetic pulse while
+  // speaking, else 0. Smoothed by the caller into `energy`.
+  function voiceTarget() {
+    const tts = window.aiTTSManager;
+    if (!tts) return 0;
+    const lvl = typeof tts.getAudioLevel === 'function' ? tts.getAudioLevel() : 0;
+    if (lvl > 0.001) return Math.min(1, lvl * 1.8);
+    if (tts.isPlaying) return 0.45 + Math.sin(t * 0.18) * 0.25; // fallback pulse
+    return 0;
+  }
+
+  function draw() {
+    if (!document.body.classList.contains('bg-pattern-core')) {
+      window.removeEventListener('resize', _onResize); canvas.remove(); return;
+    }
+    requestAnimationFrame(draw);
+    t++;
+    energy += (voiceTarget() - energy) * 0.12; // smooth toward target
+    ctx.clearRect(0, 0, W, H);
+    const { r: cr, g: cg, b: cb } = rgbOf(getColor());
+    const rgba = (a) => `rgba(${cr},${cg},${cb},${a})`;
+    const intensity = getIntensity();
+    const size = _getEffectSize();
+    const breath = Math.sin(t * 0.02) * 0.05;        // slow idle breathing
+    const surge = 1 + breath + energy * 0.35;         // overall scale factor
+    const R = baseR * size * surge;
+    ctx.globalCompositeOperation = 'lighter';
+
+    // Soft core glow lighting the centre of the orb (kept modest).
+    const glowR = R * (0.7 + energy * 0.35);
+    const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, glowR);
+    g.addColorStop(0, rgba((0.2 + energy * 0.28) * intensity));
+    g.addColorStop(0.4, rgba((0.06 + energy * 0.1) * intensity));
+    g.addColorStop(1, rgba(0));
+    ctx.fillStyle = g;
+    ctx.fillRect(cx - glowR, cy - glowR, glowR * 2, glowR * 2);
+
+    // 1. Undulating membrane — concentric rim rings whose radius is perturbed by
+    //    two harmonics plus seamless Perlin noise, squashed vertically for 3D.
+    const amp = 0.7 + energy * 0.9;
+    const STEPS = 168;
+    for (let k = 0; k < 3; k++) {
+      const Ri = R * (0.9 + k * 0.075);
+      const seed = k * 2.1;
+      ctx.lineWidth = Math.max(0.8, (1.9 - k * 0.5) * size);
+      ctx.strokeStyle = rgba((0.18 + energy * 0.18) * (1 - k * 0.18) * intensity);
+      ctx.beginPath();
+      for (let s = 0; s <= STEPS; s++) {
+        const a = (s / STEPS) * TAU;
+        const w = 0.05 * Math.sin(5 * a + t * 0.03 + seed)
+                + 0.032 * Math.sin(8 * a - t * 0.045 + seed * 1.7)
+                + (_bgSmoothNoise(Math.cos(a) * 1.6 + seed, Math.sin(a) * 1.6 + t * 0.012) - 0.5) * 0.13;
+        const rad = Ri * (1 + w * amp);
+        const x = cx + Math.cos(a) * rad;
+        const y = cy + Math.sin(a) * rad * SQUASH;
+        if (s) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+      }
+      ctx.closePath();
+      ctx.stroke();
+    }
+
+    // 2. Concentric ripples expanding out through the membrane.
+    if (--rippleTimer <= 0) { ripples.push({ life: 0, maxLife: 110 }); rippleTimer = Math.round(32 - energy * 18); }
+    ctx.lineWidth = Math.max(0.6, size);
+    for (let i = ripples.length - 1; i >= 0; i--) {
+      const rp = ripples[i];
+      if (++rp.life > rp.maxLife) { ripples.splice(i, 1); continue; }
+      const f = rp.life / rp.maxLife;
+      const rad = R * (0.2 + f * 0.78);
+      const al = Math.sin(Math.PI * f) * (0.13 + energy * 0.12) * intensity;
+      ctx.strokeStyle = rgba(al);
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, rad, rad * SQUASH, 0, 0, TAU);
+      ctx.stroke();
+    }
+
+    // 3. Inner dotted sphere — Fibonacci-lattice points, spun in 3D + projected.
+    const coreR = R * 0.34;
+    const ay = t * (0.01 + energy * 0.006), cay = Math.cos(ay), say = Math.sin(ay);
+    const ax = 0.62, cax = Math.cos(ax), sax = Math.sin(ax);
+    const FOCAL = 3;
+    for (const n of nodes) {
+      const rx = n.bx * cay + n.bz * say;
+      const rz = -n.bx * say + n.bz * cay;
+      const ry = n.by * cax - rz * sax;
+      const rz2 = n.by * sax + rz * cax;
+      const persp = FOCAL / (FOCAL - rz2);
+      n.x = cx + rx * coreR * persp;
+      n.y = cy + ry * coreR * persp * SQUASH;
+      n.depth = (rz2 + 1) / 2;          // 0 (back) .. 1 (front)
+    }
+    // Faint lattice links between nearby core dots → the "flower" grid feel.
+    const THR = coreR * 0.6, THR2 = THR * THR;
+    ctx.lineWidth = Math.max(0.5, 0.7 * size);
+    for (let i = 0; i < nodes.length; i++) {
+      const a = nodes[i];
+      for (let j = i + 1; j < nodes.length; j++) {
+        const b = nodes[j];
+        const ddx = a.x - b.x, ddy = a.y - b.y;
+        const d2 = ddx * ddx + ddy * ddy;
+        if (d2 >= THR2) continue;
+        const al = (1 - Math.sqrt(d2) / THR) * (0.08 + energy * 0.12) * (0.3 + ((a.depth + b.depth) * 0.5) * 0.7) * intensity;
+        if (al < 0.01) continue;
+        ctx.strokeStyle = rgba(al);
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+      }
+    }
+    for (const n of nodes) {
+      const a = (0.3 + energy * 0.3) * (0.2 + n.depth * 0.8) * intensity;
+      ctx.fillStyle = rgba(a);
+      ctx.beginPath(); ctx.arc(n.x, n.y, (0.8 + n.depth * 1.1) * size, 0, TAU); ctx.fill();
+    }
+
+    // Bright centre point.
+    ctx.fillStyle = `rgba(255,255,255,${(0.45 + energy * 0.4) * intensity})`;
+    ctx.beginPath(); ctx.arc(cx, cy, R * 0.045, 0, TAU); ctx.fill();
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
   }
   draw();
 }

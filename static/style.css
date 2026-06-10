@@ -35952,6 +35952,22 @@ body.theme-frosted #theme-popup .modal-content {
   -webkit-backdrop-filter: blur(24px) saturate(170%) !important;
   border-color: color-mix(in srgb, var(--fg) 22%, transparent) !important;
 }
+/* Chat message bubbles. Excluded from the panel rule above so they can use a
+   lighter tint — long AI replies need to stay readable — while still letting
+   the background animation show through. The blur keeps text legible over a
+   busy/animated backdrop. Code blocks inside keep their own opaque bg. */
+body.theme-frosted .msg-user {
+  background: color-mix(in srgb, var(--user-bubble-bg, color-mix(in srgb, var(--fg) 8%, var(--bg))) 42%, transparent) !important;
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  border-color: color-mix(in srgb, var(--fg) 18%, transparent) !important;
+}
+body.theme-frosted .msg-ai {
+  background: color-mix(in srgb, var(--ai-bubble-bg, var(--panel)) 40%, transparent) !important;
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  border-color: color-mix(in srgb, var(--fg) 18%, transparent) !important;
+}
 /* The sidebar header + user bar paint their own opaque --sidebar-bg/--panel.
    Under the frosted theme the sidebar is translucent glass, so those solid
    bands stood out as a dark (near-black) strip over the title/avatar area.
