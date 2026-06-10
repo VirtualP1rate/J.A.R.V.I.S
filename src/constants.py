@@ -7,7 +7,15 @@ APP_VERSION = "1.0.0"
 # Base paths
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + "/"
 STATIC_DIR = os.path.join(BASE_DIR, "static")
+CONFIG_DIR = os.path.join(BASE_DIR, "config")
 DATA_DIR = os.getenv("JARVIS_DATA_DIR", os.path.join(BASE_DIR, "data"))
+
+# Editable agent prompt sections (personality + behavior rules). Shipped
+# defaults live in code (src/agent_loop.py); this file lets the user override
+# any section without touching Python. See config/system_prompt.md.
+SYSTEM_PROMPT_FILE = os.getenv(
+    "JARVIS_SYSTEM_PROMPT_FILE", os.path.join(CONFIG_DIR, "system_prompt.md")
+)
 
 # Data file paths
 # Single source of truth: every persisted file/dir lives under DATA_DIR, which
@@ -49,6 +57,9 @@ GENERATED_IMAGES_DIR = os.path.join(DATA_DIR, "generated_images")
 TTS_CACHE_DIR = os.path.join(DATA_DIR, "tts_cache")
 EMAIL_URGENCY_CACHE_DIR = os.path.join(DATA_DIR, "email_urgency_cache")
 SKILLS_DIR = os.path.join(DATA_DIR, "skills")
+# Reference clips for Chatterbox voice cloning. Shared with the chatterbox
+# container, which mounts ./data/chatterbox_voices read-only at /voices.
+CHATTERBOX_VOICES_DIR = os.path.join(DATA_DIR, "chatterbox_voices")
 GALLERY_DIR = os.path.join(DATA_DIR, "gallery")
 GALLERY_UPLOADS_DIR = os.path.join(DATA_DIR, "gallery_uploads")
 MEMORY_VECTORS_DIR = os.path.join(DATA_DIR, "memory_vectors")

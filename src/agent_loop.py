@@ -9,6 +9,7 @@ The LLM decides when to use tools by writing fenced code blocks.
 import asyncio
 import collections
 import json
+import os
 import re
 import time
 import logging
@@ -37,6 +38,32 @@ from src.agent_tools import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Em/en/figure-dash and horizontal bar. The user wants these gone from every
+# response (they read as an "AI tell" and TTS mangles them); replace each, with
+# any surrounding whitespace, by a comma + space.
+_DASH_RE = re.compile(r'\s*[—–―‒]\s*')
+
+
+def _desash_stream(text: str, pending: str):
+    """Streaming-safe de-em-dash. Replaces dashes (and the whitespace around
+    them) with ', '. Because a dash and its spaces can split across token
+    deltas (e.g. "word " then "— word"), the longest trailing run of
+    whitespace/dash chars is held back in `pending` for the next delta instead
+    of being emitted half-collapsed. Returns (emit, new_pending). Call
+    _desash_flush(pending) once the stream ends to emit the remainder."""
+    buf = pending + text
+    i = len(buf)
+    while i > 0 and (buf[i - 1].isspace() or buf[i - 1] in '—–―‒'):
+        i -= 1
+    return _DASH_RE.sub(', ', buf[:i]), buf[i:]
+
+
+def _desash_flush(pending: str) -> str:
+    """Collapse a held trailing run at stream end (e.g. a message ending in a
+    dash)."""
+    return _DASH_RE.sub(', ', pending)
 
 
 def _load_mcp_disabled_map() -> Dict[str, set]:
@@ -276,14 +303,88 @@ _DOMAIN_TOOL_MAP = {
     "settings": {"manage_settings", "manage_endpoints", "manage_mcp", "manage_webhooks", "manage_tokens", "app_api"},
 }
 
+# ---------------------------------------------------------------------------
+# Editable system-prompt sections
+#
+# The shipped defaults are the Python strings above, so the agent always works
+# even with no config file. config/system_prompt.md lets the user override any
+# section without touching code:
+#   - `preamble`        the agent's identity / personality
+#   - `rules`           base behavior rules (fenced-block models)
+#   - `api_rules`       base behavior rules (native function-calling models)
+#   - `link_rules`      clickable-anchor conventions
+#   - `domain.<name>`   per-domain rule packs (web, email, cookbook, ...)
+# Sections are delimited by `<<<key>>>` lines; an absent file or section falls
+# back to the in-code default. Edits apply on the next turn — the file's mtime
+# is folded into the base-prompt cache key — so no restart is needed.
+# ---------------------------------------------------------------------------
+_SECTION_RE = re.compile(r"^<<<\s*([A-Za-z0-9_.]+)\s*>>>\s*$")
+_prompt_overrides_cache: Optional[dict] = None
+_prompt_overrides_mtime: Optional[float] = None
+
+
+def prompt_file_signature() -> str:
+    """mtime of config/system_prompt.md ('' if absent), folded into the
+    base-prompt cache key so edits take effect on the next turn."""
+    from src.constants import SYSTEM_PROMPT_FILE
+    try:
+        return str(os.path.getmtime(SYSTEM_PROMPT_FILE))
+    except OSError:
+        return ""
+
+
+def _load_prompt_overrides() -> dict:
+    """Parse config/system_prompt.md into {section_key: text}.
+
+    Re-reads only when the file's mtime changes. Returns {} when the file is
+    absent or unreadable, so every lookup falls back to the in-code default."""
+    global _prompt_overrides_cache, _prompt_overrides_mtime
+    from src.constants import SYSTEM_PROMPT_FILE
+    try:
+        mtime = os.path.getmtime(SYSTEM_PROMPT_FILE)
+    except OSError:
+        _prompt_overrides_cache, _prompt_overrides_mtime = {}, None
+        return {}
+    if _prompt_overrides_cache is not None and mtime == _prompt_overrides_mtime:
+        return _prompt_overrides_cache
+    sections: dict = {}
+    try:
+        with open(SYSTEM_PROMPT_FILE, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError as e:
+        logger.warning("Failed to read system prompt file %s: %s", SYSTEM_PROMPT_FILE, e)
+        _prompt_overrides_cache, _prompt_overrides_mtime = {}, mtime
+        return {}
+    cur, buf = None, []
+    for line in lines:
+        m = _SECTION_RE.match(line)
+        if m:
+            if cur is not None:
+                sections[cur] = "\n".join(buf).strip()
+            cur, buf = m.group(1), []
+        elif cur is not None:
+            buf.append(line)
+    if cur is not None:
+        sections[cur] = "\n".join(buf).strip()
+    _prompt_overrides_cache, _prompt_overrides_mtime = sections, mtime
+    return sections
+
+
+def _prompt(key: str, default: str) -> str:
+    """Effective text for a prompt section: the config/system_prompt.md
+    override if present and non-empty, else the shipped default."""
+    val = _load_prompt_overrides().get(key)
+    return val if isinstance(val, str) and val.strip() else default
+
+
 def _domain_rules_for_tools(tool_names: set) -> list[str]:
     names = set(tool_names or set())
     rules = []
     for domain, domain_tools in _DOMAIN_TOOL_MAP.items():
         if names & domain_tools:
-            rules.append(_DOMAIN_RULES[domain])
+            rules.append(_prompt(f"domain.{domain}", _DOMAIN_RULES[domain]))
     if names & {"create_session", "list_sessions", "manage_session", "manage_documents", "manage_notes", "manage_calendar", "manage_tasks", "manage_skills", "manage_research"}:
-        rules.append(_LINK_RULES)
+        rules.append(_prompt("link_rules", _LINK_RULES))
     return rules
 
 # Each tool section is keyed by tool name(s) it covers.
@@ -528,14 +629,14 @@ def _assemble_prompt(tool_names: set, disabled_tools: set = None, compact: bool 
     if compact:
         tool_list = ", ".join(sorted(included)) if included else "none"
         parts = [
-            "You are an AI assistant with tool access.",
+            _prompt("preamble", "You are an AI assistant with tool access."),
             f"Available tools: {tool_list}.",
-            _API_AGENT_RULES,
+            _prompt("api_rules", _API_AGENT_RULES),
         ]
         parts.extend(_domain_rules_for_tools(included))
         return "\n\n".join(parts)
 
-    parts = [_AGENT_PREAMBLE]
+    parts = [_prompt("preamble", _AGENT_PREAMBLE)]
 
     # Collect full-block tool sections (with examples)
     full_blocks = []
@@ -568,7 +669,7 @@ def _assemble_prompt(tool_names: set, disabled_tools: set = None, compact: bool 
             hint += f", ... ({len(not_shown) - 5} more)"
         parts.append(f"(Other tools available when needed: {hint})")
 
-    parts.append(_AGENT_RULES)
+    parts.append(_prompt("rules", _AGENT_RULES))
     parts.extend(_domain_rules_for_tools(included))
     return "\n\n".join(parts)
 
@@ -855,7 +956,9 @@ def _build_system_prompt(
         _ov_sig = _hl.sha256(_json.dumps(get_builtin_overrides() or {}, sort_keys=True).encode()).hexdigest()
     except Exception:
         _ov_sig = ""
-    cache_key = (frozenset(disabled_tools or []), bool(mcp_mgr), needs_admin, _rt_key, compact, _ov_sig, suppress_local_context)
+    # Fold the editable system_prompt.md signature in too, so editing the
+    # personality/rules file takes effect on the next turn (busts this cache).
+    cache_key = (frozenset(disabled_tools or []), bool(mcp_mgr), needs_admin, _rt_key, compact, _ov_sig, prompt_file_signature(), suppress_local_context)
     if _cached_base_prompt and _cached_base_prompt_key == cache_key and not active_document:
         agent_prompt = _cached_base_prompt
         # Skill index is user-editable (name + description), so it must never
@@ -2170,6 +2273,7 @@ async def stream_agent_loop(
         # complementary cap for the rare stream that trickles bytes forever and
         # so never trips the inactivity timeout. Generous — only catches runaway.
         _round_deadline = time.time() + max(agent_stream_timeout * 4, 1200)
+        _dash_pending = ""  # held-back trailing dash/whitespace for de-em-dash
         async for chunk in stream_llm_with_fallback(
             _candidates,
             messages,
@@ -2270,10 +2374,17 @@ async def stream_agent_loop(
                         # round_response unchanged.
                         if data.get("thinking"):
                             round_reasoning += data["delta"]
+                            yield chunk  # Stream all rounds
                         else:
-                            round_response += data["delta"]
-                            full_response += data["delta"]
-                        yield chunk  # Stream all rounds
+                            # Strip em/en dashes from the live answer (display +
+                            # saved content + TTS source) at this single
+                            # cross-provider chokepoint.
+                            _emit, _dash_pending = _desash_stream(data["delta"], _dash_pending)
+                            round_response += _emit
+                            full_response += _emit
+                            if _emit:
+                                data["delta"] = _emit
+                                yield f"data: {json.dumps(data)}\n\n"
                         # Detect text-fence doc streaming for rounds 2+
                         # (round 1 is handled by frontend fence detection + server fenced block path)
                         if (
@@ -2331,6 +2442,15 @@ async def stream_agent_loop(
                 # Forward error events to frontend as visible text
                 yield chunk
             # Intercept [DONE] — don't forward until all rounds finish
+
+        # Flush any held trailing dash/whitespace from the de-em-dash streamer.
+        if _dash_pending:
+            _dash_flush = _desash_flush(_dash_pending)
+            _dash_pending = ""
+            if _dash_flush:
+                round_response += _dash_flush
+                full_response += _dash_flush
+                yield f'data: {json.dumps({"delta": _dash_flush})}\n\n'
 
         tool_blocks, used_native = _resolve_tool_blocks(round_response, native_tool_calls, round_num, is_api_model=_is_api_model)
 
