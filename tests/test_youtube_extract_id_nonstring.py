@@ -1,4 +1,4 @@
-from services.youtube.youtube_handler import extract_youtube_id
+from src.youtube_handler import extract_youtube_id
 
 
 def test_extract_youtube_id_handles_non_string_url():

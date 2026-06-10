@@ -437,7 +437,7 @@ async def serve_generated_image(filename: str, request: Request):
     )
 
 # ========= YOUTUBE INIT =========
-from services.youtube import init_youtube
+from src.youtube_handler import init_youtube
 init_youtube()
 
 # ========= RAG (vector document RAG) =========

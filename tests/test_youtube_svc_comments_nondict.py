@@ -1,4 +1,4 @@
-from services.youtube.youtube_handler import format_comments_for_context
+from src.youtube_handler import format_comments_for_context
 
 
 def test_format_comments_skips_non_dict_entries():
