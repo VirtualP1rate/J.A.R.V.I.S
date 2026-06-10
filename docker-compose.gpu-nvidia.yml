@@ -105,11 +105,13 @@ services:
       - ./data/chatterbox_voices:/voices:ro
       - chatterbox-hf-cache:/root/.cache/huggingface
     environment:
+      # Order = base env + NVIDIA overlay env (docker/gpu.nvidia.yml), so this
+      # file equals base + overlay exactly (enforced by test_gpu_compose_standalone).
       - CHATTERBOX_MODEL=${CHATTERBOX_MODEL:-standard}
-      - DEVICE=cuda
       - DEFAULT_VOICE=${CHATTERBOX_DEFAULT_VOICE:-jarvis}
       - EXAGGERATION=${CHATTERBOX_EXAGGERATION:-0.5}
       - CFG_WEIGHT=${CHATTERBOX_CFG_WEIGHT:-0.5}
+      - DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     healthcheck:

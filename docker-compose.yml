@@ -87,8 +87,10 @@ services:
       - ./data/chatterbox_voices:/voices:ro
       - chatterbox-hf-cache:/root/.cache/huggingface
     environment:
+      # No DEVICE here: the image defaults to auto (cuda if available, else cpu);
+      # the NVIDIA overlay appends DEVICE=cuda. Keeps base portable and lets the
+      # standalone GPU files equal base + overlay exactly.
       - CHATTERBOX_MODEL=${CHATTERBOX_MODEL:-standard}
-      - DEVICE=${CHATTERBOX_DEVICE:-auto}
       - DEFAULT_VOICE=${CHATTERBOX_DEFAULT_VOICE:-jarvis}
       - EXAGGERATION=${CHATTERBOX_EXAGGERATION:-0.5}
       - CFG_WEIGHT=${CHATTERBOX_CFG_WEIGHT:-0.5}

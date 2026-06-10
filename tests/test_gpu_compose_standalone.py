@@ -52,12 +52,15 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
 
 
 def _merge_overlay_into_base(base: dict, overlay: dict) -> dict:
-    """Build the expected standalone config: base + overlay on jarvis only."""
+    """Build the expected standalone config: base with the overlay merged into
+    every service the overlay defines (jarvis, and — for the NVIDIA overlay —
+    the GPU-accelerated chatterbox TTS service)."""
     expected = copy.deepcopy(base)
-    overlay_service = overlay["services"][SERVICE]
-    expected["services"][SERVICE] = _deep_merge(
-        expected["services"][SERVICE], overlay_service
-    )
+    for name, svc_overlay in overlay.get("services", {}).items():
+        if name in expected["services"]:
+            expected["services"][name] = _deep_merge(expected["services"][name], svc_overlay)
+        else:
+            expected["services"][name] = copy.deepcopy(svc_overlay)
     return expected
 
 
@@ -84,11 +87,16 @@ def test_amd_standalone_equals_base_plus_overlay(base):
 # --- Non-jarvis services and volumes untouched ---------------------------
 
 
-@pytest.mark.parametrize("standalone_path", [NVIDIA_STANDALONE, AMD_STANDALONE])
-def test_non_jarvis_services_match_base(base, standalone_path):
+@pytest.mark.parametrize(
+    "standalone_path, overlay_path",
+    [(NVIDIA_STANDALONE, NVIDIA_OVERLAY), (AMD_STANDALONE, AMD_OVERLAY)],
+)
+def test_non_overlay_services_match_base(base, standalone_path, overlay_path):
+    """Services the overlay does NOT touch must be byte-identical to base."""
     standalone = _load(standalone_path)
+    overlaid = set(_load(overlay_path).get("services", {}))
     for name, definition in base["services"].items():
-        if name == SERVICE:
+        if name in overlaid:
             continue
         assert standalone["services"][name] == definition
     assert set(standalone["services"]) == set(base["services"])

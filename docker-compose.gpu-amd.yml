@@ -104,8 +104,10 @@ services:
       - ./data/chatterbox_voices:/voices:ro
       - chatterbox-hf-cache:/root/.cache/huggingface
     environment:
+      # AMD has no ROCm path in our CUDA image, so DEVICE stays unset -> the
+      # image's auto default resolves to cpu on an AMD host. Matches base exactly
+      # (the AMD overlay does not touch chatterbox).
       - CHATTERBOX_MODEL=${CHATTERBOX_MODEL:-standard}
-      - DEVICE=cpu
       - DEFAULT_VOICE=${CHATTERBOX_DEFAULT_VOICE:-jarvis}
       - EXAGGERATION=${CHATTERBOX_EXAGGERATION:-0.5}
       - CFG_WEIGHT=${CHATTERBOX_CFG_WEIGHT:-0.5}
