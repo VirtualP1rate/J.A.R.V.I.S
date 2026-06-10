@@ -10,7 +10,6 @@ Each service:
 
 from .search import SearchService, SearchResult, SearchResponse
 from .docs import DocsService, DocChunk, IndexResult
-from .research import ResearchService, ResearchResult, ResearchSource
 from .memory import MemoryService, Memory, MemorySearchResult
 from .shell import ShellService, ShellResult
 
@@ -23,10 +22,6 @@ __all__ = [
     "DocsService",
     "DocChunk",
     "IndexResult",
-    # Research
-    "ResearchService",
-    "ResearchResult",
-    "ResearchSource",
     # Memory
     "MemoryService",
     "Memory",
