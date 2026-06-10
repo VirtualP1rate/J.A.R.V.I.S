@@ -501,35 +501,33 @@ def _result_has_work(result: str | None) -> bool:
     return True
 
 
-async def action_summarize_emails(owner: str, **kwargs) -> Tuple[str, bool]:
-    """Run one pass of email summary background processing."""
+async def _run_email_pass(label: str, **pass_kwargs) -> Tuple[str, bool]:
+    """One pass of the auto summarize/reply poller, shared by the two actions."""
     try:
         from routes.email_pollers import _run_auto_summarize_once
-        result = await _run_auto_summarize_once(do_summary=True, do_reply=False)
+        result = await _run_auto_summarize_once(**pass_kwargs)
         if not _result_has_work(result):
-            raise TaskNoop(f"summarize: {result or 'no new emails'}")
+            raise TaskNoop(f"{label}: {result or 'no new emails'}")
         return result, True
     except Exception as e:
-        logger.error(f"summarize_emails action failed: {e}")
+        logger.error(f"{label} action failed: {e}")
         return str(e), False
+
+
+async def action_summarize_emails(owner: str, **kwargs) -> Tuple[str, bool]:
+    """Run one pass of email summary background processing."""
+    return await _run_email_pass("summarize", do_summary=True, do_reply=False)
 
 
 async def action_draft_email_replies(owner: str, **kwargs) -> Tuple[str, bool]:
     """Run one pass of AI reply drafting."""
-    try:
-        from routes.email_pollers import _run_auto_summarize_once
-        result = await _run_auto_summarize_once(
-            do_summary=False,
-            do_reply=True,
-            days_back=7,
-            progress_cb=kwargs.get("progress_cb"),
-        )
-        if not _result_has_work(result):
-            raise TaskNoop(f"draft replies: {result or 'no new emails'}")
-        return result, True
-    except Exception as e:
-        logger.error(f"draft_email_replies action failed: {e}")
-        return str(e), False
+    return await _run_email_pass(
+        "draft replies",
+        do_summary=False,
+        do_reply=True,
+        days_back=7,
+        progress_cb=kwargs.get("progress_cb"),
+    )
 
 
 _TYPE_COLORS = {
