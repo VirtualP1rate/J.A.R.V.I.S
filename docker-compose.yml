@@ -68,6 +68,36 @@ services:
         condition: service_healthy
       chromadb:
         condition: service_started
+      chatterbox:
+        condition: service_started
+    restart: unless-stopped
+
+  # Chatterbox (Resemble AI) text-to-speech. A small FastAPI wrapper we own
+  # (services/chatterbox) around the official MIT `chatterbox-tts` library,
+  # exposing an OpenAI-compatible /v1/audio/speech endpoint. J.A.R.V.I.S talks
+  # to it as a model endpoint: TTS provider "endpoint:<id>" -> base_url
+  # http://chatterbox:8004/v1. It clones the reference clip in ./data/chatterbox_voices.
+  # DEVICE=auto runs on CPU here for portability; the NVIDIA overlay
+  # (docker/gpu.nvidia.yml) sets DEVICE=cuda and reserves the GPU.
+  chatterbox:
+    build: ./services/chatterbox
+    ports:
+      - "${CHATTERBOX_BIND:-127.0.0.1}:8004:8004"
+    volumes:
+      - ./data/chatterbox_voices:/voices:ro
+      - chatterbox-hf-cache:/root/.cache/huggingface
+    environment:
+      - CHATTERBOX_MODEL=${CHATTERBOX_MODEL:-standard}
+      - DEVICE=${CHATTERBOX_DEVICE:-auto}
+      - DEFAULT_VOICE=${CHATTERBOX_DEFAULT_VOICE:-jarvis}
+      - EXAGGERATION=${CHATTERBOX_EXAGGERATION:-0.5}
+      - CFG_WEIGHT=${CHATTERBOX_CFG_WEIGHT:-0.5}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8004/health', timeout=5).read(1)\""]
+      interval: 15s
+      timeout: 6s
+      retries: 20
+      start_period: 120s
     restart: unless-stopped
 
   chromadb:
@@ -145,3 +175,4 @@ volumes:
   searxng-data:
   chromadb-data:
   ntfy-cache:
+  chatterbox-hf-cache:

@@ -32,3 +32,19 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  # Run Chatterbox TTS on the GPU. The image is built from services/chatterbox
+  # in the base compose; here we just force CUDA and pass the GPU through. The
+  # base torch is cu124 (works on Ampere/Ada RTX 30/40; fine for the RTX 3090).
+  chatterbox:
+    environment:
+      - DEVICE=cuda
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

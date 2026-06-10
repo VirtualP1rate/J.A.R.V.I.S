@@ -66,8 +66,18 @@ class AITTSManager {
     }
 
     extractPlainText(content) {
-        // Strip <think>/<thinking> blocks (model reasoning)
-        let cleaned = content.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '');
+        // Strip <think>/<thinking> blocks (model reasoning) so only the actual
+        // reply is read aloud. The opening tag may carry attributes the renderer
+        // adds, e.g. <think time="3.2"> (see chat.js), so match `<think ...>` with
+        // optional attributes — not just a bare `<think>`.
+        let cleaned = content
+            // Complete reasoning blocks (one per agent round).
+            .replace(/<think(?:ing)?\b[^>]*>[\s\S]*?<\/think(?:ing)?>/gi, '')
+            // An unclosed reasoning block (still streaming, or never closed):
+            // drop from the opener to the end so partial reasoning is never spoken.
+            .replace(/<think(?:ing)?\b[^>]*>[\s\S]*$/i, '')
+            // A stray orphan closing tag with no opener.
+            .replace(/<\/think(?:ing)?>/gi, '');
 
         // Create a temporary div to parse HTML/markdown
         const temp = document.createElement('div');
@@ -88,6 +98,12 @@ class AITTSManager {
             .replace(/`(.+?)`/g, '$1') // Remove inline code
             .replace(/\n{3,}/g, '\n\n') // Normalize line breaks
             .trim();
+
+        // Spoken-form fix: read the "J.A.R.V.I.S" initialism as the word "Jarvis"
+        // instead of spelling it out. Mirrors _normalize_for_speech() in
+        // tts_service.py — needed here too for browser TTS (which never hits the
+        // server) and so the client cache key matches the synthesized text.
+        text = text.replace(/(?<![A-Za-z])J\.?A\.?R\.?V\.?I\.?S(?![A-Za-z])/gi, 'Jarvis');
 
         return text;
     }

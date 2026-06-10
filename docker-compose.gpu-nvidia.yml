@@ -82,8 +82,43 @@ services:
         condition: service_healthy
       chromadb:
         condition: service_started
+      chatterbox:
+        condition: service_started
     restart: unless-stopped
     # NVIDIA overlay (from docker/gpu.nvidia.yml).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Chatterbox (Resemble AI) TTS: our FastAPI wrapper (services/chatterbox) around
+  # the official MIT chatterbox-tts library, OpenAI-compatible /v1/audio/speech on
+  # :8004. CUDA via DEVICE=cuda + GPU reservation (base + docker/gpu.nvidia.yml).
+  chatterbox:
+    build: ./services/chatterbox
+    ports:
+      - "${CHATTERBOX_BIND:-127.0.0.1}:8004:8004"
+    volumes:
+      - ./data/chatterbox_voices:/voices:ro
+      - chatterbox-hf-cache:/root/.cache/huggingface
+    environment:
+      - CHATTERBOX_MODEL=${CHATTERBOX_MODEL:-standard}
+      - DEVICE=cuda
+      - DEFAULT_VOICE=${CHATTERBOX_DEFAULT_VOICE:-jarvis}
+      - EXAGGERATION=${CHATTERBOX_EXAGGERATION:-0.5}
+      - CFG_WEIGHT=${CHATTERBOX_CFG_WEIGHT:-0.5}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8004/health', timeout=5).read(1)\""]
+      interval: 15s
+      timeout: 6s
+      retries: 20
+      start_period: 120s
+    restart: unless-stopped
     deploy:
       resources:
         reservations:
@@ -167,3 +202,4 @@ volumes:
   searxng-data:
   chromadb-data:
   ntfy-cache:
+  chatterbox-hf-cache:

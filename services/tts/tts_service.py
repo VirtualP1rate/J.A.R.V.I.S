@@ -2,6 +2,8 @@
 """Multi-provider TTS service — dispatches to local Kokoro, OpenAI-compatible API, or browser."""
 
 import io
+import os
+import re
 import wave
 import logging
 import hashlib
@@ -12,6 +14,26 @@ from typing import Optional, Dict, Any
 from src.constants import TTS_CACHE_DIR
 
 logger = logging.getLogger(__name__)
+
+# Accepted reference-clip audio extensions for the voice library.
+_VOICE_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+
+
+# Spoken-form pronunciation fixes. The brand "J.A.R.V.I.S" is an initialism with
+# periods, so TTS engines spell it out letter-by-letter ("J-A-R-V-I-S"). Rewrite
+# it (and dotless/lowercase variants) to the word so it is read as "Jarvis". A
+# leading/trailing letter guard avoids matching inside longer words, and the
+# trailing period is left intact so sentence prosody is preserved. This affects
+# synthesized audio ONLY — never the displayed text.
+_SPEECH_SUBS = [
+    (re.compile(r'(?<![A-Za-z])J\.?A\.?R\.?V\.?I\.?S(?![A-Za-z])', re.IGNORECASE), 'Jarvis'),
+]
+
+
+def _normalize_for_speech(text: str) -> str:
+    for pattern, repl in _SPEECH_SUBS:
+        text = pattern.sub(repl, text)
+    return text
 
 
 def _safe_speed(value, default: float = 1.0) -> float:
@@ -132,6 +154,16 @@ class TTSService:
             "speed": speed,
         }
 
+        # Chatterbox extras: only attach when the endpoint is Chatterbox (gate on
+        # the model name the seed sets) so strict OpenAI TTS endpoints aren't sent
+        # unknown fields. The Chatterbox server reads these per request and hot-
+        # swaps the model variant when it changes.
+        if isinstance(model, str) and "chatterbox" in model.lower():
+            from src.settings import get_setting
+            payload["exaggeration"] = _safe_speed(get_setting("tts_exaggeration", "0.5"), 0.5)
+            payload["cfg_weight"] = _safe_speed(get_setting("tts_cfg_weight", "0.5"), 0.5)
+            payload["model_variant"] = str(get_setting("tts_chatterbox_model", "turbo") or "turbo")
+
         try:
             r = httpx.post(url, json=payload, headers=headers, timeout=60)
             r.raise_for_status()
@@ -140,6 +172,76 @@ class TTSService:
         except Exception as e:
             logger.error(f"API TTS synthesis failed: {e}")
             return None
+
+    # ── Voice library (Chatterbox reference clips) ──
+
+    def _active_endpoint(self):
+        """(base_url, api_key) for the active TTS endpoint, or (None, None)."""
+        provider = self._load_settings()["tts_provider"]
+        if not provider.startswith("endpoint:"):
+            return None, None
+        endpoint_id = provider.split(":", 1)[1]
+        from src.database import SessionLocal, ModelEndpoint
+        db = SessionLocal()
+        try:
+            ep = db.query(ModelEndpoint).filter(ModelEndpoint.id == endpoint_id).first()
+            if not ep:
+                return None, None
+            return ep.base_url.rstrip("/"), ep.api_key
+        finally:
+            db.close()
+
+    def list_voices(self) -> list:
+        """List cloned voice ids from the active endpoint's /audio/voices."""
+        base_url, api_key = self._active_endpoint()
+        if not base_url:
+            return []
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        try:
+            r = httpx.get(base_url + "/audio/voices", headers=headers, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            voices = data.get("voices", []) if isinstance(data, dict) else data
+            out = []
+            for v in voices or []:
+                vid = (v.get("id") or v.get("name")) if isinstance(v, dict) else v
+                if vid:
+                    out.append(str(vid))
+            return out
+        except Exception as e:
+            logger.warning(f"Failed to list TTS voices: {e}")
+            return []
+
+    @staticmethod
+    def _safe_voice_name(name: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_-]", "", (name or "").strip())
+
+    def save_voice(self, name: str, data: bytes, ext: str) -> str:
+        """Write a reference clip into the shared Chatterbox voices dir. Returns the stem."""
+        from src.constants import CHATTERBOX_VOICES_DIR
+        stem = self._safe_voice_name(name)
+        if not stem:
+            raise ValueError("invalid voice name")
+        ext = ("." + ext.lstrip(".")).lower()
+        if ext not in _VOICE_EXTS:
+            raise ValueError(f"unsupported audio type: {ext}")
+        os.makedirs(CHATTERBOX_VOICES_DIR, exist_ok=True)
+        with open(os.path.join(CHATTERBOX_VOICES_DIR, stem + ext), "wb") as f:
+            f.write(data)
+        return stem
+
+    def delete_voice(self, name: str) -> bool:
+        from src.constants import CHATTERBOX_VOICES_DIR
+        stem = self._safe_voice_name(name)
+        if not stem:
+            return False
+        removed = False
+        for ext in _VOICE_EXTS:
+            p = os.path.join(CHATTERBOX_VOICES_DIR, stem + ext)
+            if os.path.exists(p):
+                os.remove(p)
+                removed = True
+        return removed
 
     # ── Public interface ──
 
@@ -154,6 +256,10 @@ class TTSService:
 
         if provider in ("disabled", "browser"):
             return None
+
+        # Normalize spoken form (e.g. "J.A.R.V.I.S" -> "Jarvis") before caching
+        # and truncation so the cache key matches the audio that gets produced.
+        text = _normalize_for_speech(text)
 
         if len(text) > 5000:
             text = text[:5000]

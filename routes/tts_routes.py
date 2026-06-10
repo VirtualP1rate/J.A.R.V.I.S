@@ -3,10 +3,11 @@
 TTS API routes — multi-provider (local Kokoro, API endpoint, browser).
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import Response
 from pydantic import BaseModel
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -83,5 +84,40 @@ def setup_tts_routes(tts_service):
         except Exception as e:
             logger.error(f"Failed to clear cache: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+
+    # ── Voice library (Chatterbox cloned voices) ──
+
+    @router.get("/voices")
+    async def list_tts_voices():
+        """List cloned voices available on the active TTS endpoint."""
+        try:
+            return {"voices": tts_service.list_voices()}
+        except Exception as e:
+            logger.error(f"Failed to list voices: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.post("/voices")
+    async def upload_tts_voice(request: Request, name: str = Form(...), voice_file: UploadFile = File(...)):
+        """Admin only: add a reference clip for voice cloning."""
+        from core.middleware import require_admin
+        from src.upload_limits import read_upload_limited, get_chat_upload_max_bytes
+        require_admin(request)
+        ext = os.path.splitext(voice_file.filename or "")[1]
+        data = await read_upload_limited(voice_file, get_chat_upload_max_bytes(), label="Voice clip")
+        try:
+            stem = tts_service.save_voice(name, data, ext)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"success": True, "voice": stem}
+
+    @router.delete("/voices/{name}")
+    async def delete_tts_voice(request: Request, name: str):
+        """Admin only: remove a cloned voice reference clip."""
+        from core.middleware import require_admin
+        require_admin(request)
+        removed = tts_service.delete_voice(name)
+        if not removed:
+            raise HTTPException(status_code=404, detail="voice not found")
+        return {"success": True}
 
     return router
