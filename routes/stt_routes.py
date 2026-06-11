@@ -1,6 +1,8 @@
 # routes/stt_routes.py
 """STT API routes — multi-provider (local Whisper, API endpoint, browser)."""
 
+import asyncio
+
 from fastapi import APIRouter, HTTPException, UploadFile, File
 import logging
 
@@ -36,7 +38,9 @@ def setup_stt_routes(stt_service):
             if not audio_bytes:
                 raise HTTPException(status_code=400, detail={"message": "Empty audio file"})
 
-            text = stt_service.transcribe(audio_bytes)
+            # Transcription blocks on the whisper container HTTP call or local
+            # inference — keep it off the event loop.
+            text = await asyncio.to_thread(stt_service.transcribe, audio_bytes)
             if text is None:
                 raise HTTPException(
                     status_code=500,

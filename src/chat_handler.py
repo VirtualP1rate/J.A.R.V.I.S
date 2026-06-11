@@ -229,7 +229,11 @@ class ChatHandler:
                             except Exception:
                                 vl_desc = None
                         if not vl_desc:
-                            vl_result = analyze_image_with_vl_result(file_info["path"], owner=owner)
+                            # Blocking llm_call with up to 120s timeout per
+                            # candidate model — keep it off the event loop.
+                            vl_result = await asyncio.to_thread(
+                                analyze_image_with_vl_result, file_info["path"], owner=owner
+                            )
                             vl_desc = vl_result.get("text", "")
                             vl_model = vl_result.get("model", "")
                             if vl_desc and not vl_desc.startswith("["):
