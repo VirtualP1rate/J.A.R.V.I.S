@@ -2074,6 +2074,7 @@ function _initCore() {
   let rippleTimer = 10;
   let stream = [];           // glitchy data-stream glyphs riding the rings
   const STREAM_CHARS = '0123456789ABCDEF<>/=*+#%:abcdef';
+  const waves = [];          // green voice-wave squiggles that spawn + fade out
 
   function buildNodes() {
     const N = W < 760 ? 180 : 280;
@@ -2261,6 +2262,38 @@ function _initCore() {
       ctx.fillStyle = glitch ? `rgba(255,255,255,${al})` : `hsla(${d.hue | 0},85%,${d.lum | 0}%,${al})`;
       ctx.fillText(d.ch, 0, 0);
       ctx.restore();
+    }
+
+    // 1d. Green voice-waves — short wobbly waveform arcs that pop in bright at
+    //     random spots around the rings then fade out. Spawn faster when talking.
+    if (energy > 0.04 && Math.random() < 0.12 + energy * 0.4 && waves.length < 34) {
+      waves.push({ ca: Math.random() * TAU, ringMul: 0.94 + Math.random() * 0.42,
+                   aw: 0.22 + Math.random() * 0.45, life: 0, maxLife: 26 + Math.random() * 36,
+                   amp: 0.05 + Math.random() * 0.07, freq: 1.5 + Math.random() * 2.5,
+                   seed: Math.random() * 100 });
+    }
+    for (let i = waves.length - 1; i >= 0; i--) {
+      const wv = waves[i];
+      if (++wv.life > wv.maxLife) { waves.splice(i, 1); continue; }
+      const fade = 1 - wv.life / wv.maxLife;          // bright at spawn → fade out
+      ctx.lineWidth = Math.max(0.8, 1.6 * size);
+      ctx.lineJoin = 'round';
+      ctx.strokeStyle = `rgba(120,200,255,${fade * 0.7 * intensity})`;
+      ctx.beginPath();
+      const SEG = 40;
+      for (let s = 0; s <= SEG; s++) {
+        const tt = s / SEG;
+        const a = wv.ca + (tt - 0.5) * wv.aw;
+        const taper = Math.sin(Math.PI * tt);         // 0 at ends, 1 in middle
+        // Smooth, gently undulating waveform — low frequency + soft noise.
+        const wob = (Math.sin(tt * wv.freq * TAU + wv.life * 0.4 + wv.seed)
+                   + (_bgSmoothNoise(tt * 2.5 + wv.seed, wv.life * 0.06) - 0.5)) * wv.amp * taper;
+        const rr = R * wv.ringMul * (1 + wob);
+        const x = cx + Math.cos(a) * rr;
+        const y = cy + Math.sin(a) * rr * SQUASH;
+        if (s) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+      }
+      ctx.stroke();
     }
 
     // 1b. Reaching tendrils — energy filaments that grow out of the orb, curl
