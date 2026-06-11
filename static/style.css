@@ -35968,6 +35968,14 @@ body.theme-frosted .msg-ai {
   -webkit-backdrop-filter: blur(16px) saturate(160%);
   border-color: color-mix(in srgb, var(--fg) 18%, transparent) !important;
 }
+/* The message composer / text-entry bar — translucent + blurred so the
+   background animation shows through it too. */
+body.theme-frosted .chat-input-bar {
+  background: color-mix(in srgb, var(--input-bg, var(--panel)) 42%, transparent) !important;
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  border-color: color-mix(in srgb, var(--fg) 18%, transparent) !important;
+}
 /* The sidebar header + user bar paint their own opaque --sidebar-bg/--panel.
    Under the frosted theme the sidebar is translucent glass, so those solid
    bands stood out as a dark (near-black) strip over the title/avatar area.
