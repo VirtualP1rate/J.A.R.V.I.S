@@ -122,7 +122,10 @@ services:
       - whisper-hf-cache:/root/.cache/huggingface
     environment:
       - WHISPER_MODEL=${WHISPER_MODEL:-large-v3-turbo}
-      - BEAM_SIZE=${WHISPER_BEAM_SIZE:-5}
+      # Greedy decoding (beam 1) — short conversational turns lose almost no
+      # accuracy vs beam 5 and decode ~2-3x faster, which sits directly in the
+      # end-of-speech -> first-audio critical path.
+      - BEAM_SIZE=${WHISPER_BEAM_SIZE:-1}
       - VAD_FILTER=${WHISPER_VAD_FILTER:-1}
       - DEFAULT_LANGUAGE=${WHISPER_LANGUAGE:-en}
     healthcheck:

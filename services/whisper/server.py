@@ -18,7 +18,8 @@ Env:
   DEVICE           cuda | cpu | auto (default auto -> cuda if available)
   WHISPER_MODEL    model size or HF id (default "large-v3-turbo")
   COMPUTE_TYPE     ct2 compute type (default auto: float16 on cuda, int8 on cpu)
-  BEAM_SIZE        decoding beam (default 5; 1 = greedy, lower latency)
+  BEAM_SIZE        decoding beam (default 1 = greedy, lowest latency; 5 for
+                   slightly better accuracy on hard audio at ~2-3x decode time)
   VAD_FILTER       "1"/"0" — Silero VAD to drop non-speech (default 1)
   DEFAULT_LANGUAGE force a language code, else auto-detect (default "")
   MAX_AUDIO_BYTES  reject larger uploads (default 26214400 = 25 MiB)
@@ -37,7 +38,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("whisper-server")
 
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3-turbo")
-BEAM_SIZE = int(os.getenv("BEAM_SIZE", "5"))
+BEAM_SIZE = int(os.getenv("BEAM_SIZE", "1"))
 VAD_FILTER = os.getenv("VAD_FILTER", "1") not in ("0", "false", "False", "")
 DEFAULT_LANGUAGE = os.getenv("DEFAULT_LANGUAGE", "").strip()
 MAX_AUDIO_BYTES = int(os.getenv("MAX_AUDIO_BYTES", str(25 * 1024 * 1024)))
