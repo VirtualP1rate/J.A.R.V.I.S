@@ -1119,10 +1119,17 @@ def setup_model_routes(model_discovery):
             db.close()
 
         for ep in endpoints:
+            # TTS/STT endpoints expose helper models (tts-1, whisper-1) that are
+            # not chat models. Keep them out of the chat model picker so a chat
+            # session can't select one and POST /chat/completions to the TTS/STT
+            # service (which 404s). They're configured via their own STT/TTS
+            # settings, not the model dropdown.
+            ep_model_type = getattr(ep, "model_type", None) or "llm"
+            if ep_model_type in ("tts", "stt"):
+                continue
             base = _normalize_base(ep.base_url)
             provider = _safe_detect_provider(base)
             # Merge cached + pinned models, then filter out hidden ones
-            ep_model_type = getattr(ep, "model_type", None) or "llm"
             model_ids = _visible_models(
                 _cached_model_ids(ep),
                 ep.hidden_models,

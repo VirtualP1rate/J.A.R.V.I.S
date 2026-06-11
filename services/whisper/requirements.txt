@@ -1,0 +1,9 @@
+# Self-owned OpenAI-compatible faster-whisper STT server.
+# faster-whisper runs on CTranslate2 (not torch). The base image ships the
+# CUDA 12.4 + cuDNN 9 runtime that ctranslate2>=4.5 needs for GPU inference.
+# PyAV (pulled in by faster-whisper) decodes webm/opus/wav/mp3 via the system
+# ffmpeg libs installed in the Dockerfile.
+faster-whisper==1.1.1
+fastapi
+uvicorn[standard]
+python-multipart

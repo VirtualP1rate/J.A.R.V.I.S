@@ -2829,8 +2829,9 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
           }
         }
       } else {
-        // Stop streaming TTS on any error/abort
-        if (streamingTTS && window.aiTTSManager) window.aiTTSManager.stop();
+        // Stop streaming TTS on any error/abort. (`streamingTTS` from the happy
+        // path isn't in scope in this error branch — check the manager directly.)
+        if (window.aiTTSManager && window.aiTTSManager.autoPlay) window.aiTTSManager.stop();
 
         if (currentAbort && currentAbort.signal.aborted) {
           const abortReason = currentAbort._reason || '';

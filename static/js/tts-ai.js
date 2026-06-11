@@ -33,6 +33,7 @@ class AITTSManager {
         this._streamButton = null;
         this._streamResetFn = null;
         this._streamDebounceTimer = null;
+        this._streamFirstEmitted = false; // has the first spoken chunk been queued?
 
         // Check if TTS service is available
         this.checkAvailability();
@@ -446,15 +447,18 @@ class AITTSManager {
         this._streamActive = true;
         this._streamButton = null;
         this._streamResetFn = null;
+        this._streamFirstEmitted = false; // first spoken chunk may break on a clause
     }
 
     streamingUpdate(accumulatedText) {
         if (!this._streamActive || !this.available || !this.autoPlay) return;
         if (this._streamDebounceTimer) return;
+        // Short debounce so the first phrase reaches synthesis fast — this is
+        // part of the time-to-first-audio budget in conversation mode.
         this._streamDebounceTimer = setTimeout(() => {
             this._streamDebounceTimer = null;
             this._processStreamingSentences(accumulatedText);
-        }, 150);
+        }, 60);
     }
 
     _processStreamingSentences(accumulatedText) {
@@ -475,10 +479,16 @@ class AITTSManager {
             current += newRegion[i];
             var ch = newRegion[i];
             var next = newRegion[i + 1];
-            if ((ch === '.' || ch === '!' || ch === '?') && next && /\s/.test(next)) {
+            var isSentenceEnd = (ch === '.' || ch === '!' || ch === '?') && next && /\s/.test(next);
+            // Until the first chunk has been spoken, also break on a clause
+            // boundary (comma/semicolon/colon) so J.A.R.V.I.S starts talking on
+            // the opening phrase instead of waiting for a full sentence.
+            var isClauseEnd = !this._streamFirstEmitted &&
+                (ch === ',' || ch === ';' || ch === ':') && next && /\s/.test(next);
+            if (isSentenceEnd || isClauseEnd) {
                 var lastWord = current.trim().split(/\s/).pop() || '';
-                if (/^\d+\.$/.test(lastWord)) continue;
-                if (/^[A-Z][a-z]?\.$/.test(lastWord)) continue;
+                if (isSentenceEnd && /^\d+\.$/.test(lastWord)) continue;
+                if (isSentenceEnd && /^[A-Z][a-z]?\.$/.test(lastWord)) continue;
                 sentences.push(current.trim());
                 current = '';
             }
@@ -489,13 +499,17 @@ class AITTSManager {
         var advancedChars = 0;
         for (var j = 0; j < sentences.length; j++) {
             var sentence = sentences[j];
-            if (sentence.length < 15) {
+            // Lower the floor for the very first chunk so a short opening phrase
+            // ("Sure, ...") still gets spoken immediately.
+            var minLen = this._streamFirstEmitted ? 15 : 8;
+            if (sentence.length < minLen) {
                 advancedChars += sentence.length + 1;
                 continue;
             }
             var btn = this._streamButton || this._createPlaceholderButton();
             var resetFn = this._streamResetFn || function() {};
             this.enqueue(sentence, btn, resetFn);
+            this._streamFirstEmitted = true;
             advancedChars += sentence.length + 1;
         }
 

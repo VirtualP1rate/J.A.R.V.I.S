@@ -70,6 +70,10 @@ services:
         condition: service_started
       chatterbox:
         condition: service_started
+      whisper:
+        condition: service_started
+      llamacpp:
+        condition: service_started
     restart: unless-stopped
 
   # Chatterbox (Resemble AI) text-to-speech. A small FastAPI wrapper we own
@@ -100,6 +104,72 @@ services:
       timeout: 6s
       retries: 20
       start_period: 120s
+    restart: unless-stopped
+
+  # faster-whisper (CTranslate2) speech-to-text. A small FastAPI wrapper we own
+  # (services/whisper) exposing an OpenAI-compatible /v1/audio/transcriptions
+  # endpoint. J.A.R.V.I.S talks to it as a model endpoint: STT provider
+  # "endpoint:whisper-stt" -> base_url http://whisper:8005/v1. The model is
+  # warmed at startup so the first turn isn't slow. DEVICE=auto runs on CPU here
+  # for portability; the NVIDIA overlay (docker/gpu.nvidia.yml) sets DEVICE=cuda
+  # and reserves the GPU (large-v3-turbo transcribes a short turn in well under
+  # a second on the RTX 3090).
+  whisper:
+    build: ./services/whisper
+    ports:
+      - "${WHISPER_BIND:-127.0.0.1}:8005:8005"
+    volumes:
+      - whisper-hf-cache:/root/.cache/huggingface
+    environment:
+      - WHISPER_MODEL=${WHISPER_MODEL:-large-v3-turbo}
+      - BEAM_SIZE=${WHISPER_BEAM_SIZE:-5}
+      - VAD_FILTER=${WHISPER_VAD_FILTER:-1}
+      - DEFAULT_LANGUAGE=${WHISPER_LANGUAGE:-en}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8005/health', timeout=5).read(1)\""]
+      interval: 15s
+      timeout: 6s
+      retries: 20
+      start_period: 120s
+    restart: unless-stopped
+
+  # llama.cpp LLM server (official CUDA image). Serves the local GGUF over an
+  # OpenAI-compatible API on :8888 so J.A.R.V.I.S talks to it container-to-
+  # container at http://llamacpp:8888/v1 (replaces running llama-server on the
+  # host). The model is bind-mounted from the host folder set in .env
+  # (LLAMA_MODELS_DIR); GPU passthrough + full offload come from the nvidia
+  # overlay (docker/gpu.nvidia.yml). Flags are env-overridable so you can tune
+  # ctx/offload without editing this file.
+  llamacpp:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    ports:
+      - "${LLAMA_BIND:-127.0.0.1}:8888:8888"
+    volumes:
+      - "${LLAMA_MODELS_DIR:?set LLAMA_MODELS_DIR in .env to your GGUF folder}:/models:ro"
+    command:
+      - "-m"
+      - "/models/${LLAMA_MODEL:-google_gemma-4-26B-A4B-it-IQ4_XS.gguf}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8888"
+      - "--n-gpu-layers"
+      - "${LLAMA_NGL:-999}"
+      - "--ctx-size"
+      - "${LLAMA_CTX:-8192}"
+      - "--parallel"
+      - "${LLAMA_PARALLEL:-1}"
+      - "--jinja"
+      # Reasoning/thinking budget: 0 = no thinking (immediate answer) for snappy
+      # voice replies; set LLAMA_REASONING_BUDGET=-1 to re-enable unrestricted.
+      - "--reasoning-budget"
+      - "${LLAMA_REASONING_BUDGET:-0}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8888/health || exit 1"]
+      interval: 15s
+      timeout: 6s
+      retries: 30
+      start_period: 180s
     restart: unless-stopped
 
   chromadb:
@@ -178,3 +248,4 @@ volumes:
   chromadb-data:
   ntfy-cache:
   chatterbox-hf-cache:
+  whisper-hf-cache:

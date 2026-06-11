@@ -19,6 +19,7 @@ import chatRenderer from './js/chatRenderer.js';
 import sessionModule from './js/sessions.js';
 import memoryModule from './js/memory.js';
 import voiceRecorderModule from './js/voiceRecorder.js';
+import voiceConversationModule from './js/voiceConversation.js';
 import censorModule from './js/censor.js';
 import galleryModule from './js/gallery.js';
 import tasksModule from './js/tasks.js';
@@ -3702,6 +3703,36 @@ function startJarvisApp() {
 
       // Otherwise, send message
       handleSubmit(e);
+    });
+  }
+
+  // ── Conversation mode (hands-free two-way voice) ──
+  const convoBtn = document.getElementById('voice-convo-btn');
+  if (convoBtn) {
+    const _convoTitles = {
+      off: 'Conversation mode (hands-free voice)',
+      listening: 'Listening… (click to stop)',
+      thinking: 'Thinking…',
+      speaking: 'Speaking… (talk to interrupt)',
+    };
+    voiceConversationModule.configure({
+      // handleChatSubmit() calls e.preventDefault() unguarded, so pass a stub
+      // event — the rest of the submit path reads from the DOM, not the event.
+      submit: () => handleSubmit({ preventDefault() {}, stopPropagation() {} }),
+      showToast: uiModule.showToast,
+      showError: uiModule.showError,
+      onState: (state) => {
+        convoBtn.classList.remove('convo-listening', 'convo-thinking', 'convo-speaking');
+        const active = state && state !== 'off';
+        convoBtn.classList.toggle('convo-active', active);
+        if (active) convoBtn.classList.add('convo-' + state);
+        convoBtn.setAttribute('aria-pressed', active ? 'true' : 'false');
+        convoBtn.title = _convoTitles[state] || _convoTitles.off;
+      },
+    });
+    convoBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      voiceConversationModule.toggle();
     });
   }
 
