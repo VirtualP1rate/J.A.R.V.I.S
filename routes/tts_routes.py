@@ -4,9 +4,10 @@ TTS API routes — multi-provider (local Kokoro, API endpoint, browser).
 """
 
 import asyncio
+import itertools
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Form
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 import logging
 import os
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 class TTSRequest(BaseModel):
     text: str
-    format: str = "audio"  # "audio" or "base64"
+    format: str = "audio"  # "audio", "base64", or "stream" (progressive bytes)
 
 def setup_tts_routes(tts_service):
     """Setup TTS routes with the provided TTS service"""
@@ -43,6 +44,28 @@ def setup_tts_routes(tts_service):
             # Synthesis blocks on remote HTTP or local GPU inference for
             # seconds per call (one call per sentence in conversation mode) —
             # keep it off the event loop so concurrent SSE streams keep flowing.
+            if request.format == "stream":
+                # Progressive audio: bytes go out as the TTS engine produces
+                # them (Chatterbox yields PCM per text chunk), so playback can
+                # start before the full text is synthesized. The generator is
+                # sync — Starlette iterates it in a worker thread, keeping the
+                # event loop free. Pull the first piece eagerly so an outright
+                # failure is still a clean 500 rather than an empty 200.
+                gen = tts_service.synthesize_stream(request.text)
+                first = await asyncio.to_thread(next, gen, None)
+                if first is None:
+                    raise HTTPException(
+                        status_code=500,
+                        detail={"message": "Synthesis failed"}
+                    )
+                if first[:4] == b"RIFF":
+                    mime = "audio/wav"
+                elif first[:3] == b'ID3' or (len(first) >= 2 and first[0] == 0xff and (first[1] & 0xe0) == 0xe0):
+                    mime = "audio/mpeg"
+                else:
+                    mime = "application/octet-stream"
+                return StreamingResponse(itertools.chain([first], gen), media_type=mime)
+
             if request.format == "base64":
                 audio_b64 = await asyncio.to_thread(tts_service.synthesize_to_base64, request.text)
                 if not audio_b64:

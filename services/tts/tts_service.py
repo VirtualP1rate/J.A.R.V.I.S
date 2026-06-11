@@ -127,7 +127,9 @@ class TTSService:
 
     # ── API endpoint ──
 
-    def _synthesize_api(self, text: str, endpoint_id: str, model: str, voice: str, speed: float = 1.0) -> Optional[bytes]:
+    def _build_api_request(self, text: str, endpoint_id: str, model: str, voice: str, speed: float):
+        """(url, headers, payload) for the endpoint provider, or None if the
+        endpoint row is missing. Shared by the one-shot and streaming paths."""
         from src.database import SessionLocal, ModelEndpoint
 
         db = SessionLocal()
@@ -141,7 +143,6 @@ class TTSService:
         finally:
             db.close()
 
-        url = base_url + "/audio/speech"
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -163,15 +164,35 @@ class TTSService:
             payload["exaggeration"] = _safe_speed(get_setting("tts_exaggeration", "0.5"), 0.5)
             payload["cfg_weight"] = _safe_speed(get_setting("tts_cfg_weight", "0.5"), 0.5)
             payload["model_variant"] = str(get_setting("tts_chatterbox_model", "turbo") or "turbo")
+        return base_url + "/audio/speech", headers, payload
 
+    def _synthesize_api(self, text: str, endpoint_id: str, model: str, voice: str, speed: float = 1.0) -> Optional[bytes]:
+        built = self._build_api_request(text, endpoint_id, model, voice, speed)
+        if not built:
+            return None
+        url, headers, payload = built
         try:
             r = httpx.post(url, json=payload, headers=headers, timeout=60)
             r.raise_for_status()
-            logger.info(f"API TTS: {len(r.content)} bytes from {base_url}")
+            logger.info(f"API TTS: {len(r.content)} bytes from {url}")
             return r.content
         except Exception as e:
             logger.error(f"API TTS synthesis failed: {e}")
             return None
+
+    def _synthesize_api_stream(self, text: str, endpoint_id: str, model: str, voice: str, speed: float = 1.0):
+        """Yield audio bytes as the endpoint produces them. Chatterbox gets
+        stream=true (chunked WAV: PCM flows out per text chunk); other endpoints
+        are simply relayed as their bytes arrive."""
+        built = self._build_api_request(text, endpoint_id, model, voice, speed)
+        if not built:
+            return
+        url, headers, payload = built
+        if isinstance(model, str) and "chatterbox" in model.lower():
+            payload["stream"] = True
+        with httpx.stream("POST", url, json=payload, headers=headers, timeout=60) as r:
+            r.raise_for_status()
+            yield from r.iter_bytes()
 
     # ── Voice library (Chatterbox reference clips) ──
 
@@ -292,6 +313,61 @@ class TTSService:
             self._put_cache(key, audio_data)
 
         return audio_data
+
+    def synthesize_stream(self, text: str):
+        """Yield audio bytes progressively (generator). A cache hit yields the
+        cached blob whole; the endpoint provider relays bytes as the upstream
+        produces them (Chatterbox streams PCM per text chunk); local/other
+        providers fall back to one-shot synthesis. On a complete stream the
+        assembled audio is cached under the same key as synthesize()."""
+        settings = self._load_settings()
+        if settings.get("tts_enabled") is False:
+            return
+        provider = settings["tts_provider"]
+        if provider in ("disabled", "browser"):
+            return
+        model = settings["tts_model"]
+        voice = settings["tts_voice"]
+        speed = _safe_speed(settings.get("tts_speed", "1"))
+
+        text = _normalize_for_speech(text)
+        if len(text) > 5000:
+            text = text[:5000]
+
+        key = self._cache_key(text, provider, model, voice, speed)
+        cached = self._get_cached(key)
+        if cached:
+            logger.info(f"TTS cache hit ({len(text)} chars, streamed)")
+            yield cached
+            return
+
+        if not provider.startswith("endpoint:"):
+            data = self.synthesize(text)
+            if data:
+                yield data
+            return
+
+        endpoint_id = provider.split(":", 1)[1]
+        parts = []
+        try:
+            for piece in self._synthesize_api_stream(text, endpoint_id, model, voice, speed):
+                parts.append(piece)
+                yield piece
+        except Exception as e:
+            logger.error(f"Streaming TTS failed: {e}")
+            if parts:
+                # Mid-stream failure: bytes already went out, the clip just ends
+                # early. Don't cache the truncated audio.
+                return
+            data = self._synthesize_api(text, endpoint_id, model, voice, speed)
+            if data:
+                yield data
+            return
+        if parts:
+            try:
+                self._put_cache(key, b"".join(parts))
+            except Exception as e:
+                logger.warning(f"TTS stream cache write failed: {e}")
 
     def synthesize_to_base64(self, text: str) -> Optional[str]:
         import base64

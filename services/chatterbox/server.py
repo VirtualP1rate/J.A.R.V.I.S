@@ -23,6 +23,7 @@ import io
 import logging
 import os
 import re
+import struct
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -32,7 +33,7 @@ import numpy as np
 import soundfile as sf
 import torch
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
@@ -156,6 +157,7 @@ class SpeechRequest(BaseModel):
     exaggeration: Optional[float] = None
     cfg_weight: Optional[float] = None
     model_variant: Optional[str] = None    # "standard" | "turbo"; hot-swaps if changed
+    stream: bool = False                   # chunked WAV: PCM streams out as each text chunk is generated
 
 
 @app.get("/health")
@@ -175,7 +177,10 @@ async def current_model():
     return {"variant": _STATE.get("variant")}
 
 
-def _synthesize(req: SpeechRequest) -> bytes:
+def _prepare(req: SpeechRequest):
+    """Validate the request and resolve voice/knobs. Raises 400 on bad input
+    BEFORE any response bytes go out (matters for the streaming path, where an
+    error after the first yield can only abort the connection)."""
     text = (req.input or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="input is empty")
@@ -185,36 +190,50 @@ def _synthesize(req: SpeechRequest) -> bytes:
     ref = _resolve_voice(req.voice)
     exaggeration = req.exaggeration if req.exaggeration is not None else DEFAULT_EXAGGERATION
     cfg_weight = req.cfg_weight if req.cfg_weight is not None else DEFAULT_CFG_WEIGHT
-
-    gen_kwargs = {"exaggeration": exaggeration, "cfg_weight": cfg_weight}
     if ref is None:
         logger.warning("No reference clip found in %s; using Chatterbox default voice.", VOICES_DIR)
+    return text, ref, exaggeration, {"exaggeration": exaggeration, "cfg_weight": cfg_weight}
 
-    chunks = _split_text(text)
-    if not chunks:
-        raise HTTPException(status_code=400, detail="nothing to synthesize")
 
-    # Serialize synthesis; hot-swap the model first if a different variant was requested.
+def _ensure_conditionals(model, ref, exaggeration: float):
+    """Voice conditioning is expensive, so bake it into the model once per
+    (variant, clip, exaggeration) and reuse it. generate() falls back to
+    the cached model.conds whenever audio_prompt_path is omitted — which is
+    exactly what generate(audio_prompt_path=ref) would recompute every call.
+    Caller holds _MODEL_LOCK."""
+    if ref is not None:
+        key = (_STATE.get("variant"), str(ref), round(exaggeration, 3))
+        if _STATE.get("cond_key") != key:
+            model.prepare_conditionals(str(ref), exaggeration=exaggeration)
+            _STATE["cond_key"] = key
+
+
+def _generate_chunk(req: SpeechRequest, chunk: str, ref, exaggeration: float,
+                    gen_kwargs: dict) -> tuple[np.ndarray, int]:
+    """Synthesize one text chunk under the model lock. Acquiring per chunk (not
+    per request) keeps the lock from being held while streamed bytes drain to a
+    slow client, and lets concurrent requests interleave at chunk granularity."""
     with _MODEL_LOCK:
         _ensure_variant(req.model_variant)
         model = _STATE["model"]
         if model is None:
             raise HTTPException(status_code=503, detail="model not loaded")
-        # Voice conditioning is expensive, so bake it into the model once per
-        # (variant, clip, exaggeration) and reuse it. generate() falls back to
-        # the cached model.conds whenever audio_prompt_path is omitted — which is
-        # exactly what generate(audio_prompt_path=ref) would recompute every call.
-        if ref is not None:
-            key = (_STATE.get("variant"), str(ref), round(exaggeration, 3))
-            if _STATE.get("cond_key") != key:
-                model.prepare_conditionals(str(ref), exaggeration=exaggeration)
-                _STATE["cond_key"] = key
-        pieces = []
-        for chunk in chunks:
-            with torch.no_grad():
-                wav = model.generate(chunk, **gen_kwargs)
-            pieces.append(wav.squeeze(0).detach().cpu().numpy().astype(np.float32))
-        sr = int(model.sr)
+        _ensure_conditionals(model, ref, exaggeration)
+        with torch.no_grad():
+            wav = model.generate(chunk, **gen_kwargs)
+        return wav.squeeze(0).detach().cpu().numpy().astype(np.float32), int(model.sr)
+
+
+def _synthesize(req: SpeechRequest) -> bytes:
+    text, ref, exaggeration, gen_kwargs = _prepare(req)
+    chunks = _split_text(text)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="nothing to synthesize")
+
+    pieces, sr = [], 0
+    for chunk in chunks:
+        pcm, sr = _generate_chunk(req, chunk, ref, exaggeration, gen_kwargs)
+        pieces.append(pcm)
 
     audio = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
     buf = io.BytesIO()
@@ -222,8 +241,67 @@ def _synthesize(req: SpeechRequest) -> bytes:
     return buf.getvalue()
 
 
+def _wav_stream_header(sr: int) -> bytes:
+    """44-byte PCM16-mono WAV header with max-size RIFF/data fields — the
+    streaming-WAV convention; players read frames until EOF."""
+    return (b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVE"
+            + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, sr, sr * 2, 2, 16)
+            + b"data" + struct.pack("<I", 0xFFFFFFFF))
+
+
+def _split_text_streaming(text: str) -> list[str]:
+    """Sentence-packed chunks with growing budgets (~100 -> 220 -> 480 ->
+    CHUNK_CHARS). A small first chunk gets the opening audio out fast; each
+    later chunk at most ~doubles, so with GPU synthesis running >2x realtime
+    a clip's playback outlasts the next chunk's generation and the stream
+    stays (near-)gapless. A single sentence longer than its budget becomes
+    its own chunk — never split mid-sentence."""
+    text = text.strip()
+    if not text:
+        return []
+    budgets = (100, 220, 480)
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    chunks, current = [], ""
+    for s in sentences:
+        budget = budgets[len(chunks)] if len(chunks) < len(budgets) else CHUNK_CHARS
+        if current and len(current) + len(s) + 1 > budget:
+            chunks.append(current)
+            current = s
+        else:
+            current = f"{current} {s}".strip()
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _synthesize_stream(req: SpeechRequest, ref, exaggeration: float,
+                       gen_kwargs: dict, chunks: list[str]):
+    """Yield a WAV header, then raw PCM16 as each text chunk finishes — the
+    client starts playing after the first chunk instead of the whole text.
+    Sync generator: Starlette iterates it in a worker thread."""
+    header_sent = False
+    for chunk in chunks:
+        pcm, sr = _generate_chunk(req, chunk, ref, exaggeration, gen_kwargs)
+        if not header_sent:
+            yield _wav_stream_header(sr)
+            header_sent = True
+        yield (np.clip(pcm, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+
+
+# Sync handlers: FastAPI runs them in a worker thread, so the blocking GPU
+# synthesis (seconds per call under _MODEL_LOCK) never stalls the event loop —
+# /health and other requests stay responsive while a clip is being generated.
 @app.post("/v1/audio/speech")
-async def speech(req: SpeechRequest):
+def speech(req: SpeechRequest):
+    if req.stream:
+        text, ref, exaggeration, gen_kwargs = _prepare(req)
+        chunks = _split_text_streaming(text)
+        if not chunks:
+            raise HTTPException(status_code=400, detail="nothing to synthesize")
+        return StreamingResponse(
+            _synthesize_stream(req, ref, exaggeration, gen_kwargs, chunks),
+            media_type="audio/wav",
+            headers={"Content-Disposition": "inline; filename=speech.wav"})
     audio = _synthesize(req)
     return Response(content=audio, media_type="audio/wav",
                     headers={"Content-Disposition": "inline; filename=speech.wav"})
@@ -233,5 +311,5 @@ async def speech(req: SpeechRequest):
 # ends in /v1 this resolves to /v1/audio/speech above. Tolerate the un-versioned
 # path too in case base_url is set without /v1.
 @app.post("/audio/speech")
-async def speech_unversioned(req: SpeechRequest):
-    return await speech(req)
+def speech_unversioned(req: SpeechRequest):
+    return speech(req)

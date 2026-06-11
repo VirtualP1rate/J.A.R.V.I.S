@@ -22,6 +22,7 @@ class AITTSManager {
         this._analyser = null;
         this._levelData = null;
         this._sourced = new WeakSet(); // audio elements already routed (source once each)
+        this._streamPlayback = null;   // active progressive-playback handle (cancel() on stop)
 
         // Queue for sequential auto-play
         this._queue = [];       // Array of { text, button, resetFn }
@@ -276,18 +277,23 @@ class AITTSManager {
      * failure (no Web Audio, autoplay policy, etc.) is swallowed and playback
      * continues unaffected — visuals simply fall back to the isPlaying flag.
      */
+    _ensureAudioGraph() {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return null;
+        if (!this._audioCtx) {
+            this._audioCtx = new AC();
+            this._analyser = this._audioCtx.createAnalyser();
+            this._analyser.fftSize = 256;
+            this._analyser.connect(this._audioCtx.destination);
+            this._levelData = new Uint8Array(this._analyser.fftSize);
+        }
+        if (this._audioCtx.state === 'suspended') this._audioCtx.resume();
+        return this._audioCtx;
+    }
+
     _routeToAnalyser(audio) {
         try {
-            const AC = window.AudioContext || window.webkitAudioContext;
-            if (!AC) return;
-            if (!this._audioCtx) {
-                this._audioCtx = new AC();
-                this._analyser = this._audioCtx.createAnalyser();
-                this._analyser.fftSize = 256;
-                this._analyser.connect(this._audioCtx.destination);
-                this._levelData = new Uint8Array(this._analyser.fftSize);
-            }
-            if (this._audioCtx.state === 'suspended') this._audioCtx.resume();
+            if (!this._ensureAudioGraph()) return;
             if (this._sourced.has(audio)) return;
             const src = this._audioCtx.createMediaElementSource(audio);
             src.connect(this._analyser);
@@ -329,6 +335,11 @@ class AITTSManager {
         this._queue = [];
         this._processing = false;
 
+        if (this._streamPlayback) {
+            this._streamPlayback.cancel();
+            this._streamPlayback = null;
+            this.isPlaying = false;
+        }
         if (this.useBrowserTTS) {
             window.speechSynthesis.cancel();
             this.isPlaying = false;
@@ -385,6 +396,25 @@ class AITTSManager {
         try {
             if (!this._processing) return;
 
+            // Long uncached server-TTS texts play progressively — audio starts
+            // after the first synthesized chunk instead of after the whole
+            // clip. Short sentences (conversation mode) keep the one-shot path,
+            // whose prefetch pipeline already overlaps synthesis with playback.
+            const plainText = this.extractPlainText(text);
+            const cacheKey = this.getCacheKey(plainText);
+            if (!this.useBrowserTTS && this._provider.startsWith('endpoint:') &&
+                plainText.length >= 240 && !this.cache.has(cacheKey) && !this._inflight.has(cacheKey)) {
+                const upcoming = this._queue[1];
+                if (upcoming) this._prefetch(upcoming.text);
+                await this._playStreamed(plainText, cacheKey, () => {
+                    button.innerHTML = ICON_STOP;
+                    button.classList.remove('loading');
+                    button.classList.add('playing');
+                    button.title = 'Stop';
+                });
+                return;
+            }
+
             const audioUrl = await this.synthesize(text);
 
             if (!this._processing) return;
@@ -407,37 +437,173 @@ class AITTSManager {
                     this.currentAudio.pause();
                     this.currentAudio = null;
                 }
-
-                await new Promise((resolve, reject) => {
-                    const audio = new Audio(audioUrl);
-                    if (this._provider === 'local' && this.playbackSpeed !== 1) {
-                        audio.playbackRate = this.playbackSpeed;
-                    }
-                    this.currentAudio = audio;
-                    this._routeToAnalyser(audio);
-                    audio.onended = () => {
-                        this.isPlaying = false;
-                        if (this.currentAudio === audio) this.currentAudio = null;
-                        resolve();
-                    };
-                    audio.onerror = (e) => {
-                        this.isPlaying = false;
-                        if (this.currentAudio === audio) this.currentAudio = null;
-                        reject(new Error('Audio playback error'));
-                    };
-                    audio.onpause = () => {
-                        if (this.currentAudio !== audio) {
-                            resolve();
-                        }
-                    };
-                    audio.play().then(() => {
-                        this.isPlaying = true;
-                    }).catch(reject);
-                });
+                await this._playUrl(audioUrl);
             }
         } finally {
             if (resetFn) resetFn();
         }
+    }
+
+    _playUrl(audioUrl) {
+        return new Promise((resolve, reject) => {
+            const audio = new Audio(audioUrl);
+            if (this._provider === 'local' && this.playbackSpeed !== 1) {
+                audio.playbackRate = this.playbackSpeed;
+            }
+            this.currentAudio = audio;
+            this._routeToAnalyser(audio);
+            audio.onended = () => {
+                this.isPlaying = false;
+                if (this.currentAudio === audio) this.currentAudio = null;
+                resolve();
+            };
+            audio.onerror = (e) => {
+                this.isPlaying = false;
+                if (this.currentAudio === audio) this.currentAudio = null;
+                reject(new Error('Audio playback error'));
+            };
+            audio.onpause = () => {
+                if (this.currentAudio !== audio) {
+                    resolve();
+                }
+            };
+            audio.play().then(() => {
+                this.isPlaying = true;
+            }).catch(reject);
+        });
+    }
+
+    /**
+     * Progressive playback: fetch `/api/tts/synthesize` with format "stream"
+     * and start playing PCM as it arrives, instead of waiting for the whole
+     * clip. The server (Chatterbox) emits a WAV header followed by PCM16 mono
+     * chunks, one per text chunk — each is scheduled as an AudioBufferSource
+     * back-to-back, routed through the shared analyser so the orb still
+     * reacts. Non-WAV bytes (e.g. an OpenAI endpoint returning mp3) are
+     * accumulated and played as a regular blob at the end. The assembled
+     * audio is cached under `cacheKey` for instant replay.
+     */
+    async _playStreamed(plainText, cacheKey, onStart = null) {
+        const ctx = this._ensureAudioGraph();
+        if (!ctx) throw new Error('Web Audio unavailable');
+
+        const response = await fetch('/api/tts/synthesize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: plainText, format: 'stream' })
+        });
+        if (!response.ok || !response.body) {
+            let msg = 'Synthesis failed';
+            try { msg = (await response.json()).detail?.message || msg; } catch {}
+            throw new Error(msg);
+        }
+
+        const reader = response.body.getReader();
+        const playback = {
+            cancelled: false,
+            sources: new Set(),
+            cancel: () => {
+                playback.cancelled = true;
+                try { reader.cancel(); } catch {}
+                for (const s of playback.sources) { try { s.stop(); } catch {} }
+                playback.sources.clear();
+            }
+        };
+        this._streamPlayback = playback;
+
+        const received = [];
+        let pre = new Uint8Array(0);   // bytes accumulated until the header is parsed
+        let headerParsed = false, wavMode = false, sampleRate = 0;
+        let carry = -1;                // odd trailing byte split across chunks
+        let nextTime = 0;
+        let streamEnded = false;
+        let started = false;
+        let finishResolve;
+        const finished = new Promise(r => { finishResolve = r; });
+        const maybeFinish = () => {
+            if (streamEnded && playback.sources.size === 0) finishResolve();
+        };
+
+        const schedule = (bytes) => {
+            let buf = bytes;
+            if (carry >= 0) {
+                const merged = new Uint8Array(buf.length + 1);
+                merged[0] = carry;
+                merged.set(buf, 1);
+                buf = merged;
+                carry = -1;
+            }
+            const usable = buf.length & ~1;
+            if (usable < buf.length) carry = buf[usable];
+            if (usable === 0) return;
+            const samples = new Int16Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + usable));
+            const audioBuf = ctx.createBuffer(1, samples.length, sampleRate);
+            const channel = audioBuf.getChannelData(0);
+            for (let i = 0; i < samples.length; i++) channel[i] = samples[i] / 32768;
+            const src = ctx.createBufferSource();
+            src.buffer = audioBuf;
+            src.connect(this._analyser);
+            playback.sources.add(src);
+            src.onended = () => { playback.sources.delete(src); maybeFinish(); };
+            // 40ms jitter floor for the first buffer; afterwards chunks butt up
+            // against the previous one's end so playback is gapless.
+            const startAt = Math.max(ctx.currentTime + 0.04, nextTime);
+            src.start(startAt);
+            nextTime = startAt + audioBuf.duration;
+            this.isPlaying = true;
+            if (!started) { started = true; if (onStart) onStart(); }
+        };
+
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done || playback.cancelled) break;
+                received.push(value);
+                if (!headerParsed) {
+                    const merged = new Uint8Array(pre.length + value.length);
+                    merged.set(pre);
+                    merged.set(value, pre.length);
+                    pre = merged;
+                    if (pre.length < 44) continue;
+                    wavMode = pre[0] === 0x52 && pre[1] === 0x49 && pre[2] === 0x46 && pre[3] === 0x46; // "RIFF"
+                    headerParsed = true;
+                    if (wavMode) {
+                        sampleRate = new DataView(pre.buffer, pre.byteOffset).getUint32(24, true);
+                        schedule(pre.subarray(44));
+                    }
+                    continue;
+                }
+                if (wavMode) schedule(value);
+            }
+        } finally {
+            streamEnded = true;
+        }
+
+        if (playback.cancelled) {
+            this.isPlaying = false;
+            if (this._streamPlayback === playback) this._streamPlayback = null;
+            return;
+        }
+
+        if (cacheKey && received.length) {
+            const blob = new Blob(received, { type: wavMode ? 'audio/wav' : 'audio/mpeg' });
+            this.cache.set(cacheKey, URL.createObjectURL(blob));
+        }
+
+        if (!wavMode) {
+            // Unknown container — play the fully-received bytes the normal way.
+            if (this._streamPlayback === playback) this._streamPlayback = null;
+            if (!received.length) throw new Error('Synthesis returned no audio');
+            if (onStart) onStart();
+            await this._playUrl(this.cache.get(cacheKey) ||
+                URL.createObjectURL(new Blob(received, { type: 'audio/mpeg' })));
+            return;
+        }
+
+        maybeFinish();
+        await finished;
+        this.isPlaying = false;
+        if (this._streamPlayback === playback) this._streamPlayback = null;
     }
 
     // ── Streaming TTS (sentence-by-sentence) ──
