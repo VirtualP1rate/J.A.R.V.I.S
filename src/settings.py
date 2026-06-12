@@ -44,6 +44,10 @@ DEFAULT_SETTINGS = {
     "tts_model": "tts-1",
     "tts_voice": "alloy",
     "tts_speed": "1",
+    # Chatterbox-specific knobs (only used when the active TTS endpoint is Chatterbox).
+    "tts_exaggeration": "0.5",       # expressiveness 0-1+ (lower = calmer)
+    "tts_cfg_weight": "0.5",         # pace/adherence 0-1 (lower ~0.3 = faster)
+    "tts_chatterbox_model": "turbo",  # "standard" | "turbo" (server hot-swaps)
     "stt_enabled": False,
     "stt_provider": "disabled",
     "stt_model": "base",

@@ -2494,7 +2494,7 @@ async def do_manage_calendar(content: str, owner: Optional[str] = None) -> Dict:
 
 # ── Cookbook tools ──
 
-# In-process loopback base for agent tools that call Odysseus's own API
+# In-process loopback base for agent tools that call J.A.R.V.I.S's own API
 # (cookbook state, model serve, gallery, email, calendar). We ride the
 # per-process internal token so require_admin lets us through. See
 # core/middleware.py. Resolution (override / APP_PORT / 7000) lives in
@@ -2506,7 +2506,7 @@ def _internal_headers(owner: Optional[str] = None) -> Dict[str, str]:
     from core.middleware import INTERNAL_TOOL_HEADER, INTERNAL_TOOL_TOKEN
     headers = {INTERNAL_TOOL_HEADER: INTERNAL_TOOL_TOKEN}
     if owner:
-        headers["X-Odysseus-Owner"] = owner
+        headers["X-J.A.R.V.I.S-Owner"] = owner
     return headers
 
 
@@ -2830,7 +2830,7 @@ _APP_API_BLOCKLIST_METHOD_PATH = (
 
 
 async def do_app_api(content: str, owner: Optional[str] = None) -> Dict:
-    """Generic loopback to allowed internal Odysseus API endpoints. Lets the
+    """Generic loopback to allowed internal J.A.R.V.I.S API endpoints. Lets the
     agent reach the full UI-button surface (cookbook, email, notes,
     calendar, skills, sessions, gallery, research, etc.) without us
     landing a named tool wrapper for every one.
@@ -3341,7 +3341,7 @@ async def do_list_served_models(content: str, owner: Optional[str] = None) -> Di
                 # Prefer a window around a Python traceback if one exists,
                 # falling back to the last 30 lines. The previous 6-line
                 # tail showed only the post-crash bash prompt / neofetch
-                # banner ("Locale: C / Ubuntu_Odysseus ❯") — useless for
+                # banner ("Locale: C / Ubuntu_J.A.R.V.I.S ❯") — useless for
                 # diagnosis. The traceback we want is usually 50-200 lines
                 # earlier in the buffer.
                 _tail_lines = tail.splitlines()
@@ -3503,7 +3503,7 @@ async def do_tail_serve_output(content: str, owner: Optional[str] = None) -> Dic
                     if not sport:
                         sport = t.get("sshPort") or ""
                     break
-    # Prefer the persisted /tmp/odysseus-tmux/SESSION.log file over the
+    # Prefer the persisted /tmp/jarvis-tmux/SESSION.log file over the
     # live tmux pane. The pane is what the user would see scrolling on
     # their screen — including the post-crash neofetch banner and the
     # idle bash prompt that overwrites the actual traceback the moment
@@ -3511,7 +3511,7 @@ async def do_tail_serve_output(content: str, owner: Optional[str] = None) -> Dic
     # process and survives the crash unchanged. We only fall back to
     # the pane when the log file doesn't exist (older sessions launched
     # before the tmux+tee wrapper was added).
-    log_path = f"/tmp/odysseus-tmux/{session_id}.log"
+    log_path = f"/tmp/jarvis-tmux/{session_id}.log"
     pane_inner = f"tmux capture-pane -t {shlex.quote(session_id)} -p -S -{tail} 2>/dev/null"
     file_inner = f"tail -n {tail} {shlex.quote(log_path)} 2>/dev/null"
     inner = (

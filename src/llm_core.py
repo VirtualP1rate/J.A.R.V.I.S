@@ -270,7 +270,10 @@ def _is_ollama_native_url(url: str) -> bool:
     path = (parsed.path or "").rstrip("/")
     if _host_match(url, "ollama.com"):
         return True
-    if path.startswith("/v1"):
+    # OpenAI-compatible paths are never native Ollama. Ollama's own OpenAI shim
+    # lives at /v1; servers like lemonade-sdk expose theirs at /api/v1 (and can
+    # share Ollama's 11434 port), so exempt both before the port/host heuristic.
+    if path.startswith("/v1") or path.startswith("/api/v1"):
         return False
     local_ollama_host = host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or parsed.port == 11434
     return local_ollama_host and (path == "" or path == "/api" or path.startswith("/api/"))
@@ -304,9 +307,9 @@ def _normalize_ollama_url(url: str) -> str:
 
 
 def _ollama_normalize_tool_messages(messages: List[Dict]) -> List[Dict]:
-    """Adapt Odysseus' canonical OpenAI-style messages to native Ollama /api/chat.
+    """Adapt J.A.R.V.I.S' canonical OpenAI-style messages to native Ollama /api/chat.
 
-    Odysseus carries assistant tool calls in the OpenAI shape, where
+    J.A.R.V.I.S carries assistant tool calls in the OpenAI shape, where
     `function.arguments` is a JSON *string*. Native Ollama expects it to be a
     JSON *object*; given the string it fails the whole request with HTTP 400
     "Value looks like object, but can't find closing '}' symbol", which aborts
@@ -440,8 +443,8 @@ def _provider_headers(provider: str, headers: Optional[Dict] = None) -> Dict[str
     if isinstance(headers, dict):
         h.update(headers)
     if provider == "openrouter":
-        h.setdefault("HTTP-Referer", "https://github.com/pewdiepie-archdaemon/odysseus")
-        h.setdefault("X-OpenRouter-Title", "Odysseus")
+        h.setdefault("HTTP-Referer", "https://github.com/pewdiepie-archdaemon/jarvis")
+        h.setdefault("X-OpenRouter-Title", "J.A.R.V.I.S")
     if provider == "copilot":
         # Ensure the Copilot-required headers are present even when the caller
         # didn't pass pre-built headers (e.g. model listing). build_headers()
@@ -800,7 +803,7 @@ def _as_content_blocks(content) -> List[Dict]:
 
 
 def _sanitize_llm_messages(messages: List[Dict]) -> List[Dict]:
-    """Strip Odysseus-only metadata before sending messages to providers.
+    """Strip J.A.R.V.I.S-only metadata before sending messages to providers.
 
     Per the OpenAI chat format: user/system messages must have content; a tool
     message needs content + tool_call_id; an assistant message may carry content,
@@ -1198,31 +1201,14 @@ def _dedupe_candidates(candidates):
     return out
 
 
-def llm_call_with_fallback(candidates, messages, **kwargs) -> str:
-    """Sync `llm_call` with an ordered fallback chain.
+async def llm_call_async_with_fallback(candidates, messages, **kwargs) -> str:
+    """`llm_call_async` with an ordered fallback chain.
 
-    `candidates` is a list of (url, model, headers). The first one that returns
+    `candidates` is a list of (url, model, headers); the first that returns
     without an exception wins. Connection / 5xx-style failures fall through to
     the next candidate. The dead-host cooldown inside `llm_call` makes repeat
     attempts at an offline primary effectively free.
     """
-    cands = _dedupe_candidates(candidates)
-    if not cands:
-        raise HTTPException(503, "No model endpoint configured")
-    last_err = None
-    for i, (url, model, headers) in enumerate(cands):
-        try:
-            return llm_call(url, model, messages, headers=headers, **kwargs)
-        except Exception as e:
-            last_err = e
-            tag = "primary" if i == 0 else "candidate"
-            logger.warning(f"[fallback] {tag} {model} failed ({type(e).__name__}); trying next")
-            continue
-    raise last_err if last_err else HTTPException(503, "All fallback candidates failed")
-
-
-async def llm_call_async_with_fallback(candidates, messages, **kwargs) -> str:
-    """Async variant of `llm_call_with_fallback` — same semantics."""
     cands = _dedupe_candidates(candidates)
     if not cands:
         raise HTTPException(503, "No model endpoint configured")

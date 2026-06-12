@@ -22,7 +22,7 @@ router = APIRouter(prefix="/api/mcp", tags=["mcp"])
 
 
 def _mcp_oauth_base_dir() -> Path:
-    """Directory that may contain OAuth files managed by Odysseus."""
+    """Directory that may contain OAuth files managed by J.A.R.V.I.S."""
     return Path(MCP_OAUTH_DIR).resolve(strict=False)
 
 
@@ -482,7 +482,7 @@ def setup_mcp_routes(mcp_manager: McpManager):
         if resolve_pending(state, code):
             return HTMLResponse(_oauth_result_page(
                 "Authorization Successful",
-                "The MCP server is connecting. You can close this window and return to Odysseus.",
+                "The MCP server is connecting. You can close this window and return to J.A.R.V.I.S.",
                 success=True,
             ))
         # Legacy Google path: state is the server_id
@@ -508,7 +508,7 @@ def setup_mcp_routes(mcp_manager: McpManager):
         if state and resolve_pending(state, code):
             return HTMLResponse(_oauth_result_page(
                 "Authorization Successful",
-                "The MCP server is connecting. You can close this window and return to Odysseus.",
+                "The MCP server is connecting. You can close this window and return to J.A.R.V.I.S.",
                 success=True,
             ))
 
@@ -612,7 +612,7 @@ def _oauth_authorize_page(auth_url: str, server_id: str, host: str) -> str:
     host = html.escape(host, quote=True)
     return f"""<!DOCTYPE html>
 <html><head>
-<meta charset="UTF-8"><title>Authorize — Odysseus</title>
+<meta charset="UTF-8"><title>Authorize — J.A.R.V.I.S</title>
 <style>
   body {{ font-family: 'Fira Code', monospace; background: #0f0f0f; color: #e0e0e0;
     display: flex; justify-content: center; align-items: center; min-height: 100vh; }}

@@ -331,7 +331,7 @@ async def action_run_script(owner: str, script: str = "", host: str = "", **kwar
     """Run a script locally, or via SSH when a host is configured."""
     if not script:
         return "No script specified", False
-    target_host = (host or os.getenv("ODYSSEUS_SCRIPT_HOST", "localhost")).strip()
+    target_host = (host or os.getenv("JARVIS_SCRIPT_HOST", "localhost")).strip()
     if target_host in ("", "localhost", "127.0.0.1", "local"):
         if IS_WINDOWS and find_bash():
             return await _run_subprocess([find_bash(), "-c", script], timeout=300, label="Script")
@@ -501,35 +501,33 @@ def _result_has_work(result: str | None) -> bool:
     return True
 
 
-async def action_summarize_emails(owner: str, **kwargs) -> Tuple[str, bool]:
-    """Run one pass of email summary background processing."""
+async def _run_email_pass(label: str, **pass_kwargs) -> Tuple[str, bool]:
+    """One pass of the auto summarize/reply poller, shared by the two actions."""
     try:
         from routes.email_pollers import _run_auto_summarize_once
-        result = await _run_auto_summarize_once(do_summary=True, do_reply=False)
+        result = await _run_auto_summarize_once(**pass_kwargs)
         if not _result_has_work(result):
-            raise TaskNoop(f"summarize: {result or 'no new emails'}")
+            raise TaskNoop(f"{label}: {result or 'no new emails'}")
         return result, True
     except Exception as e:
-        logger.error(f"summarize_emails action failed: {e}")
+        logger.error(f"{label} action failed: {e}")
         return str(e), False
+
+
+async def action_summarize_emails(owner: str, **kwargs) -> Tuple[str, bool]:
+    """Run one pass of email summary background processing."""
+    return await _run_email_pass("summarize", do_summary=True, do_reply=False)
 
 
 async def action_draft_email_replies(owner: str, **kwargs) -> Tuple[str, bool]:
     """Run one pass of AI reply drafting."""
-    try:
-        from routes.email_pollers import _run_auto_summarize_once
-        result = await _run_auto_summarize_once(
-            do_summary=False,
-            do_reply=True,
-            days_back=7,
-            progress_cb=kwargs.get("progress_cb"),
-        )
-        if not _result_has_work(result):
-            raise TaskNoop(f"draft replies: {result or 'no new emails'}")
-        return result, True
-    except Exception as e:
-        logger.error(f"draft_email_replies action failed: {e}")
-        return str(e), False
+    return await _run_email_pass(
+        "draft replies",
+        do_summary=False,
+        do_reply=True,
+        days_back=7,
+        progress_cb=kwargs.get("progress_cb"),
+    )
 
 
 _TYPE_COLORS = {
@@ -1567,12 +1565,12 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                             if not raw:
                                 continue
                             msg = _email_mod.message_from_bytes(raw)
-                            # Skip Odysseus-generated reminders so the scanner
+                            # Skip J.A.R.V.I.S-generated reminders so the scanner
                             # doesn't classify its own emails as urgent and
                             # trigger a feedback loop. Match on either the
                             # stamped headers OR the subject prefix.
-                            _ody_origin = (msg.get("X-Odysseus-Origin") or "").strip().lower()
-                            _ody_kind = (msg.get("X-Odysseus-Kind") or "").strip().lower()
+                            _ody_origin = (msg.get("X-J.A.R.V.I.S-Origin") or "").strip().lower()
+                            _ody_kind = (msg.get("X-J.A.R.V.I.S-Kind") or "").strip().lower()
                             _raw_subj = (msg.get("Subject") or "").lower()
                             # MCP path drops custom headers (email_server's
                             # schema doesn't accept them), so we ALSO match the
@@ -1580,8 +1578,8 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                             # always stamps. Anything that looks self-generated
                             # is dropped before classification to prevent the
                             # scanner from labelling its own emails "urgent".
-                            if (_ody_origin == "odysseus-ui" or _ody_kind == "reminder"
-                                    or _raw_subj.startswith("reminder (odysseus):")
+                            if (_ody_origin == "jarvis-ui" or _ody_kind == "reminder"
+                                    or _raw_subj.startswith("reminder (jarvis):")
                                     or _raw_subj.startswith("reminder:")
                                     or _raw_subj.startswith("[task]")):
                                 # Drop this candidate entirely — don't list it
@@ -1869,7 +1867,7 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
             # one — so the reminder email tells you which messages to act on,
             # not just "4 needing reply". Optional deep-link when the user has
             # `app_public_url` configured in Settings (so the email row links
-            # straight into the Odysseus Email tab).
+            # straight into the J.A.R.V.I.S Email tab).
             # Sort: highest-scored UIDs first; cap at 10 to keep the email tidy.
             sorted_urgent = sorted(
                 ((k, per_uid_scores[k]) for k in urgent_keys),
@@ -2239,7 +2237,7 @@ BUILTIN_ACTION_INFO = {
     "daily_brief": "Build a morning digest: today's calendar, unread email count + top senders, active todos",
     "learn_sender_signatures": "LLM learns each sender's signature from 3+ of their recent emails; cached per address so future renders fold sigs reliably without heuristics",
     "ssh_command": "Run a shell command on a local or remote host",
-    "run_script": "Run a script locally or on ODYSSEUS_SCRIPT_HOST",
+    "run_script": "Run a script locally or on JARVIS_SCRIPT_HOST",
     "test_skills": "Run the per-skill Test on every skill: agent run + LLM judge → records verdict on the skill (pass/needs_work/fail/inconclusive). Advisory only — never rewrites or demotes anything.",
     "audit_skills": "Audit unaudited skills after enough new skills are added: test, narrow metadata, self-edit/retry, optional teacher rewrite, tag duplicates/trivial skills, and publish/draft using the auto-approve threshold.",
     "check_email_urgency": "Scan unread emails hourly, tag urgent/reply-soon/newsletter/marketing/spam, and send a reminder when a new email needs a fast reply.",

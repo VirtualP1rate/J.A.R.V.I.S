@@ -101,7 +101,7 @@ def _default_document_owner() -> str | None:
     but the document library is owner-filtered. Stamp drafts to the configured
     single/default admin so assistant-created email drafts are visible.
     """
-    owner = os.environ.get("ODYSSEUS_DOCUMENT_OWNER", "").strip()
+    owner = os.environ.get("JARVIS_DOCUMENT_OWNER", "").strip()
     if owner:
         return owner
     try:
@@ -1016,7 +1016,7 @@ def _create_email_draft_document(
     account=None,
     source_message_id=None,
 ):
-    """Create an Odysseus email compose document for user review. Does not send."""
+    """Create an J.A.R.V.I.S email compose document for user review. Does not send."""
     from core.database import SessionLocal, Document, DocumentVersion
     try:
         from src.event_bus import fire_event
@@ -1128,7 +1128,7 @@ def _create_email_draft_document(
 
 
 def _draft_reply_to_email(uid, body, folder="INBOX", reply_all=False, account=None, title=None):
-    """Create a threaded Odysseus reply draft document. Does not send."""
+    """Create a threaded J.A.R.V.I.S reply draft document. Does not send."""
     conn = _imap_connect(account)
     conn.select(_q(folder), readonly=True)
     status, msg_data = conn.uid("FETCH", _b(uid), "(BODY.PEEK[])")
@@ -1180,7 +1180,7 @@ def _draft_reply_to_email(uid, body, folder="INBOX", reply_all=False, account=No
 
 
 async def _ai_draft_reply_to_email(uid, folder="INBOX", reply_all=False, account=None, title=None):
-    """Generate a reply with Odysseus' AI-reply prompt/style, then create a compose doc."""
+    """Generate a reply with J.A.R.V.I.S' AI-reply prompt/style, then create a compose doc."""
     read_result = _read_email(uid=uid, folder=folder, account=account)
     if "error" in read_result:
         return read_result
@@ -1512,7 +1512,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="list_email_accounts",
             description=(
-                "List the email accounts configured in Odysseus. Returns each account's "
+                "List the email accounts configured in J.A.R.V.I.S. Returns each account's "
                 "name, email address, and whether it's the default. Use this first when "
                 "the user asks about a specific inbox by name (e.g. 'check work')."
             ),
@@ -1578,7 +1578,7 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Send a new email via SMTP. Provide recipient(s), subject, and body. "
                 "This sends immediately; for normal assistant-written email, prefer "
-                "draft_email so the user can review and send from Odysseus. "
+                "draft_email so the user can review and send from J.A.R.V.I.S. "
                 "For replying to an existing thread, use reply_to_email instead. "
                 "Pass `account` to send from a non-default mailbox."
             ),
@@ -1598,10 +1598,10 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="draft_email",
             description=(
-                "Create a new Odysseus email compose draft document. This DOES NOT send. "
+                "Create a new J.A.R.V.I.S email compose draft document. This DOES NOT send. "
                 "Use this as the default way to write an email for the user: it opens "
                 "a reviewable email document with To/Cc/Bcc/Subject/body, and the user "
-                "can edit or press Send in Odysseus. "
+                "can edit or press Send in J.A.R.V.I.S. "
                 f"{_writing_style_guidance()}"
             ),
             inputSchema={
@@ -1612,7 +1612,7 @@ async def list_tools() -> list[Tool]:
                     "body": {"type": "string", "description": "Draft body"},
                     "cc": {"type": "string", "description": "CC address(es), comma-separated (optional)"},
                     "bcc": {"type": "string", "description": "BCC address(es), comma-separated (optional)"},
-                    "title": {"type": "string", "description": "Optional Odysseus document title"},
+                    "title": {"type": "string", "description": "Optional J.A.R.V.I.S document title"},
                     **ACCOUNT_PROP,
                 },
                 "required": ["to", "subject", "body"],
@@ -1623,7 +1623,7 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Reply to an existing email by UID. This sends immediately; for normal "
                 "assistant-written replies, prefer draft_email_reply so the user can "
-                "review and send from Odysseus. Automatically threads the reply with "
+                "review and send from J.A.R.V.I.S. Automatically threads the reply with "
                 "In-Reply-To and References headers, prefixes 'Re:' on the subject, and "
                 "uses the original sender as the recipient. Set reply_all=true to also CC "
                 "the original To/Cc recipients. For follow-up 'reply ...' requests, use "
@@ -1644,7 +1644,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="draft_email_reply",
             description=(
-                "Create an Odysseus email reply draft document for an existing email UID. "
+                "Create an J.A.R.V.I.S email reply draft document for an existing email UID. "
                 "This DOES NOT send. It threads the draft with In-Reply-To/References, "
                 "prefills the recipient and subject, and stores source email metadata so "
                 "the user can review and send from the normal email composer. "
@@ -1657,7 +1657,7 @@ async def list_tools() -> list[Tool]:
                     "body": {"type": "string", "description": "Draft reply body text"},
                     "folder": {"type": "string", "description": "IMAP folder (default: INBOX)", "default": "INBOX"},
                     "reply_all": {"type": "boolean", "description": "Reply to all recipients (default: false)", "default": False},
-                    "title": {"type": "string", "description": "Optional Odysseus document title"},
+                    "title": {"type": "string", "description": "Optional J.A.R.V.I.S document title"},
                     **ACCOUNT_PROP,
                 },
                 "required": ["uid", "body"],
@@ -1666,7 +1666,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="ai_draft_email_reply",
             description=(
-                "Generate an AI reply using Odysseus' existing AI Reply behavior, "
+                "Generate an AI reply using J.A.R.V.I.S' existing AI Reply behavior, "
                 "including Settings > Email > Writing Style, then create an email "
                 "compose document for review. This DOES NOT send and does NOT save "
                 "to the mailbox Drafts folder. Use this when the user asks you to "
@@ -1678,7 +1678,7 @@ async def list_tools() -> list[Tool]:
                     "uid": {"type": "string", "description": "Exact Email UID from list_emails/read_email; never invent UID 1"},
                     "folder": {"type": "string", "description": "IMAP folder (default: INBOX)", "default": "INBOX"},
                     "reply_all": {"type": "boolean", "description": "Reply to all recipients (default: false)", "default": False},
-                    "title": {"type": "string", "description": "Optional Odysseus document title"},
+                    "title": {"type": "string", "description": "Optional J.A.R.V.I.S document title"},
                     **ACCOUNT_PROP,
                 },
                 "required": ["uid"],
@@ -2029,9 +2029,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(
                 type="text",
                 text=(
-                    f"Created Odysseus email draft `{result['title']}` "
+                    f"Created J.A.R.V.I.S email draft `{result['title']}` "
                     f"(document ID: {result['doc_id']}){acct_note}. "
-                    "It has not been sent; open the document in Odysseus to review and send."
+                    "It has not been sent; open the document in J.A.R.V.I.S to review and send."
                 ),
             )]
 
@@ -2075,9 +2075,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(
                 type="text",
                 text=(
-                    f"Created Odysseus reply draft `{result['title']}` for UID {uid} "
+                    f"Created J.A.R.V.I.S reply draft `{result['title']}` for UID {uid} "
                     f"(document ID: {result['doc_id']}){acct_note}. "
-                    "It has not been sent; open the document in Odysseus to review and send."
+                    "It has not been sent; open the document in J.A.R.V.I.S to review and send."
                 ),
             )]
 
@@ -2098,9 +2098,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(
                 type="text",
                 text=(
-                    f"Generated AI reply and created Odysseus compose draft "
+                    f"Generated AI reply and created J.A.R.V.I.S compose draft "
                     f"`{result['title']}` for UID {uid} (document ID: {result['doc_id']}){acct_note}. "
-                    "It has not been sent; open the document in Odysseus to review and send."
+                    "It has not been sent; open the document in J.A.R.V.I.S to review and send."
                 ),
             )]
 

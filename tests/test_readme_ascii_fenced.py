@@ -10,7 +10,7 @@ README = Path(__file__).resolve().parent.parent / "README.md"
 
 # Distinctive bits of the banner (box-drawing rule + the kaomoji version line).
 _RULE = "─" * 10
-_BANNER_LINE = "Odysseus vers. 1.0"
+_BANNER_LINE = "J.A.R.V.I.S vers. 1.0"
 
 
 def _fenced_segments(text: str):
@@ -31,4 +31,4 @@ def test_readme_banner_is_inside_a_code_fence():
 def test_readme_title_stays_a_heading():
     # The H1 must remain a real heading, not get swallowed into the fence.
     first = README.read_text(encoding="utf-8").splitlines()[0]
-    assert first.strip() == "# Odysseus"
+    assert first.strip() == "# J.A.R.V.I.S"

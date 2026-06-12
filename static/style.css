@@ -1,5 +1,5 @@
 /* ============================================ */
-/* Odysseus UI — Consolidated Stylesheet        */
+/* J.A.R.V.I.S UI — Consolidated Stylesheet        */
 /* ============================================ */
 
 
@@ -2420,6 +2420,41 @@ body.bg-pattern-sparkles {
        — don't run the opacity fade transition so we never flash from
        0.5 → hover-1.0 → drop-back. The state holds steady. */
     .input-icon-btn.expanded { transition: none; }
+    /* Conversation mode (hands-free voice) — the mic button glows and pulses
+       differently per state: listening (accent), thinking (steady), speaking
+       (breathing). */
+    #voice-convo-btn.convo-active {
+      opacity: 1;
+      color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 14%, transparent);
+    }
+    #voice-convo-btn.convo-listening {
+      animation: convo-pulse 1.1s ease-in-out infinite;
+    }
+    #voice-convo-btn.convo-thinking {
+      color: color-mix(in srgb, var(--accent) 70%, var(--fg));
+      animation: convo-blink 0.9s ease-in-out infinite;
+    }
+    #voice-convo-btn.convo-speaking {
+      animation: convo-breathe 1.6s ease-in-out infinite;
+    }
+    @keyframes convo-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent); }
+      50%      { box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 0%, transparent); }
+    }
+    @keyframes convo-blink {
+      0%, 100% { opacity: 1; }
+      50%      { opacity: 0.45; }
+    }
+    @keyframes convo-breathe {
+      0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 35%, transparent); transform: scale(1); }
+      50%      { box-shadow: 0 0 6px 2px color-mix(in srgb, var(--accent) 30%, transparent); transform: scale(1.06); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #voice-convo-btn.convo-listening,
+      #voice-convo-btn.convo-thinking,
+      #voice-convo-btn.convo-speaking { animation: none; }
+    }
     /* Accent color for Research, Compare toolbar indicators */
     #research-toggle-btn.active,
     .tool-indicator.active {
@@ -5650,7 +5685,7 @@ body.bg-pattern-sparkles {
     /* (legacy toolbar-toggle styles removed — now using .vis-* classes) */
 
     /* Demo highlight pulse */
-    .odysseus-highlight {
+    .jarvis-highlight {
       outline: 2px solid var(--accent, var(--red)) !important;
       outline-offset: 1px;
       box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent, var(--red)) 18%, transparent);
@@ -5778,7 +5813,7 @@ body.bg-pattern-sparkles {
     @media (prefers-reduced-motion: reduce) {
       .th-cursor, .th-modal-group, .th-zone { animation: none !important; }
     }
-    .odysseus-hl-label {
+    .jarvis-hl-label {
       position: absolute;
       top: -22px;
       left: 8px;
@@ -21648,7 +21683,7 @@ body.gallery-selecting .gallery-dl-btn,
 
 /* Welcome name — left-to-right wipe with a touch of horizontal stretch.
    Fires on initial render via the .welcome-name rule; restarts on Nobody⇄
-   Odysseus toggle via JS reflow trick. */
+   J.A.R.V.I.S toggle via JS reflow trick. */
 .welcome-name {
   transform-origin: left center;
   animation: welcome-name-reveal 0.55s cubic-bezier(0.34, 1.32, 0.55, 1) both;
@@ -35951,6 +35986,30 @@ body.theme-frosted #theme-popup .modal-content {
   backdrop-filter: blur(24px) saturate(170%) !important;
   -webkit-backdrop-filter: blur(24px) saturate(170%) !important;
   border-color: color-mix(in srgb, var(--fg) 22%, transparent) !important;
+}
+/* Chat message bubbles. Excluded from the panel rule above so they can use a
+   lighter tint — long AI replies need to stay readable — while still letting
+   the background animation show through. The blur keeps text legible over a
+   busy/animated backdrop. Code blocks inside keep their own opaque bg. */
+body.theme-frosted .msg-user {
+  background: color-mix(in srgb, var(--user-bubble-bg, color-mix(in srgb, var(--fg) 8%, var(--bg))) 42%, transparent) !important;
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  border-color: color-mix(in srgb, var(--fg) 18%, transparent) !important;
+}
+body.theme-frosted .msg-ai {
+  background: color-mix(in srgb, var(--ai-bubble-bg, var(--panel)) 40%, transparent) !important;
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  border-color: color-mix(in srgb, var(--fg) 18%, transparent) !important;
+}
+/* The message composer / text-entry bar — translucent + blurred so the
+   background animation shows through it too. */
+body.theme-frosted .chat-input-bar {
+  background: color-mix(in srgb, var(--input-bg, var(--panel)) 42%, transparent) !important;
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  border-color: color-mix(in srgb, var(--fg) 18%, transparent) !important;
 }
 /* The sidebar header + user bar paint their own opaque --sidebar-bg/--panel.
    Under the frosted theme the sidebar is translucent glass, so those solid

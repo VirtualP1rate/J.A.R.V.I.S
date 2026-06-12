@@ -12,6 +12,17 @@ class AITTSManager {
         this._provider = 'disabled';
         this.autoPlay = false;
         this.cache = new Map(); // Client-side audio cache
+        this._inflight = new Map(); // cacheKey -> in-flight synthesize() promise (dedupe + prefetch)
+
+        // Web Audio analyser for voice-reactive visuals (lazily created on first
+        // server-TTS playback). Lets the background "core" animation pulse to the
+        // actual voice waveform via getAudioLevel(). Browser speechSynthesis has
+        // no tappable stream, so getAudioLevel() returns 0 on that path.
+        this._audioCtx = null;
+        this._analyser = null;
+        this._levelData = null;
+        this._sourced = new WeakSet(); // audio elements already routed (source once each)
+        this._streamPlayback = null;   // active progressive-playback handle (cancel() on stop)
 
         // Queue for sequential auto-play
         this._queue = [];       // Array of { text, button, resetFn }
@@ -19,10 +30,12 @@ class AITTSManager {
 
         // Streaming sentence-by-sentence TTS state
         this._streamSentencesSent = 0;  // chars of plain text already queued
+        this._streamLatestText = '';    // newest snapshot for the debounce timer
         this._streamActive = false;
         this._streamButton = null;
         this._streamResetFn = null;
         this._streamDebounceTimer = null;
+        this._streamFirstEmitted = false; // has the first spoken chunk been queued?
 
         // Check if TTS service is available
         this.checkAvailability();
@@ -66,8 +79,18 @@ class AITTSManager {
     }
 
     extractPlainText(content) {
-        // Strip <think>/<thinking> blocks (model reasoning)
-        let cleaned = content.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '');
+        // Strip <think>/<thinking> blocks (model reasoning) so only the actual
+        // reply is read aloud. The opening tag may carry attributes the renderer
+        // adds, e.g. <think time="3.2"> (see chat.js), so match `<think ...>` with
+        // optional attributes — not just a bare `<think>`.
+        let cleaned = content
+            // Complete reasoning blocks (one per agent round).
+            .replace(/<think(?:ing)?\b[^>]*>[\s\S]*?<\/think(?:ing)?>/gi, '')
+            // An unclosed reasoning block (still streaming, or never closed):
+            // drop from the opener to the end so partial reasoning is never spoken.
+            .replace(/<think(?:ing)?\b[^>]*>[\s\S]*$/i, '')
+            // A stray orphan closing tag with no opener.
+            .replace(/<\/think(?:ing)?>/gi, '');
 
         // Create a temporary div to parse HTML/markdown
         const temp = document.createElement('div');
@@ -88,6 +111,12 @@ class AITTSManager {
             .replace(/`(.+?)`/g, '$1') // Remove inline code
             .replace(/\n{3,}/g, '\n\n') // Normalize line breaks
             .trim();
+
+        // Spoken-form fix: read the "J.A.R.V.I.S" initialism as the word "Jarvis"
+        // instead of spelling it out. Mirrors _normalize_for_speech() in
+        // tts_service.py — needed here too for browser TTS (which never hits the
+        // server) and so the client cache key matches the synthesized text.
+        text = text.replace(/(?<![A-Za-z])J\.?A\.?R\.?V\.?I\.?S(?![A-Za-z])/gi, 'Jarvis');
 
         return text;
     }
@@ -125,8 +154,13 @@ class AITTSManager {
         if (this.cache.has(cacheKey)) {
             return this.cache.get(cacheKey);
         }
+        // Share an in-flight request so a prefetch and the real playback call
+        // for the same text don't synthesize twice.
+        if (this._inflight.has(cacheKey)) {
+            return this._inflight.get(cacheKey);
+        }
 
-        try {
+        const promise = (async () => {
             if (onProgress) onProgress('synthesizing');
 
             const response = await fetch('/api/tts/synthesize', {
@@ -154,11 +188,29 @@ class AITTSManager {
             if (onProgress) onProgress('complete');
 
             return audioUrl;
+        })();
 
+        this._inflight.set(cacheKey, promise);
+        try {
+            return await promise;
         } catch (error) {
             if (onProgress) onProgress('error');
             throw error;
+        } finally {
+            this._inflight.delete(cacheKey);
         }
+    }
+
+    /**
+     * Warm the cache for upcoming queued sentences without blocking. Synthesis
+     * runs on the server while the current clip plays on the client, so the next
+     * sentence's audio is usually ready by the time this one ends — eliminating
+     * the gap that otherwise makes playback stutter ("speak a few words, pause,
+     * speak more"). Fire-and-forget; errors surface when the item actually plays.
+     */
+    _prefetch(text) {
+        if (!text || this.useBrowserTTS || !this.available) return;
+        this.synthesize(text).catch(() => {});
     }
 
     _findBrowserVoice() {
@@ -218,6 +270,56 @@ class AITTSManager {
         });
     }
 
+    /**
+     * Route an <audio> element through a shared AnalyserNode so getAudioLevel()
+     * can report the live voice amplitude. Each element can only be sourced once
+     * (createMediaElementAudioSource throws otherwise), and the analyser is wired
+     * to the context destination so playback stays audible. Best-effort: any
+     * failure (no Web Audio, autoplay policy, etc.) is swallowed and playback
+     * continues unaffected — visuals simply fall back to the isPlaying flag.
+     */
+    _ensureAudioGraph() {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return null;
+        if (!this._audioCtx) {
+            this._audioCtx = new AC();
+            this._analyser = this._audioCtx.createAnalyser();
+            this._analyser.fftSize = 256;
+            this._analyser.connect(this._audioCtx.destination);
+            this._levelData = new Uint8Array(this._analyser.fftSize);
+        }
+        if (this._audioCtx.state === 'suspended') this._audioCtx.resume();
+        return this._audioCtx;
+    }
+
+    _routeToAnalyser(audio) {
+        try {
+            if (!this._ensureAudioGraph()) return;
+            if (this._sourced.has(audio)) return;
+            const src = this._audioCtx.createMediaElementSource(audio);
+            src.connect(this._analyser);
+            this._sourced.add(audio);
+        } catch (_e) {
+            // Web Audio unavailable / element already sourced — ignore.
+        }
+    }
+
+    /**
+     * Current voice amplitude as RMS in 0..1, for voice-reactive visuals.
+     * Returns 0 when not playing server TTS or when no analyser is wired
+     * (e.g. the browser speechSynthesis path).
+     */
+    getAudioLevel() {
+        if (!this.isPlaying || !this._analyser || !this._levelData) return 0;
+        this._analyser.getByteTimeDomainData(this._levelData);
+        let sum = 0;
+        for (let i = 0; i < this._levelData.length; i++) {
+            const v = (this._levelData[i] - 128) / 128; // center on 0
+            sum += v * v;
+        }
+        return Math.sqrt(sum / this._levelData.length);
+    }
+
     stop() {
         // Cancel streaming TTS
         this._streamActive = false;
@@ -226,6 +328,7 @@ class AITTSManager {
             this._streamDebounceTimer = null;
         }
         this._streamSentencesSent = 0;
+        this._streamLatestText = '';
 
         // Clear the entire queue and reset all queued buttons
         for (const item of this._queue) {
@@ -234,6 +337,11 @@ class AITTSManager {
         this._queue = [];
         this._processing = false;
 
+        if (this._streamPlayback) {
+            this._streamPlayback.cancel();
+            this._streamPlayback = null;
+            this.isPlaying = false;
+        }
         if (this.useBrowserTTS) {
             window.speechSynthesis.cancel();
             this.isPlaying = false;
@@ -290,9 +398,33 @@ class AITTSManager {
         try {
             if (!this._processing) return;
 
+            // Long uncached server-TTS texts play progressively — audio starts
+            // after the first synthesized chunk instead of after the whole
+            // clip. Short sentences (conversation mode) keep the one-shot path,
+            // whose prefetch pipeline already overlaps synthesis with playback.
+            const plainText = this.extractPlainText(text);
+            const cacheKey = this.getCacheKey(plainText);
+            if (!this.useBrowserTTS && this._provider.startsWith('endpoint:') &&
+                plainText.length >= 240 && !this.cache.has(cacheKey) && !this._inflight.has(cacheKey)) {
+                const upcoming = this._queue[1];
+                if (upcoming) this._prefetch(upcoming.text);
+                await this._playStreamed(plainText, cacheKey, () => {
+                    button.innerHTML = ICON_STOP;
+                    button.classList.remove('loading');
+                    button.classList.add('playing');
+                    button.title = 'Stop';
+                });
+                return;
+            }
+
             const audioUrl = await this.synthesize(text);
 
             if (!this._processing) return;
+
+            // Prefetch the next queued sentence's audio so its synthesis overlaps
+            // this clip's playback instead of stalling between sentences.
+            const next = this._queue[1];
+            if (next) this._prefetch(next.text);
 
             button.innerHTML = ICON_STOP;
             button.classList.remove('loading');
@@ -307,54 +439,215 @@ class AITTSManager {
                     this.currentAudio.pause();
                     this.currentAudio = null;
                 }
-
-                await new Promise((resolve, reject) => {
-                    const audio = new Audio(audioUrl);
-                    if (this._provider === 'local' && this.playbackSpeed !== 1) {
-                        audio.playbackRate = this.playbackSpeed;
-                    }
-                    this.currentAudio = audio;
-                    audio.onended = () => {
-                        this.isPlaying = false;
-                        if (this.currentAudio === audio) this.currentAudio = null;
-                        resolve();
-                    };
-                    audio.onerror = (e) => {
-                        this.isPlaying = false;
-                        if (this.currentAudio === audio) this.currentAudio = null;
-                        reject(new Error('Audio playback error'));
-                    };
-                    audio.onpause = () => {
-                        if (this.currentAudio !== audio) {
-                            resolve();
-                        }
-                    };
-                    audio.play().then(() => {
-                        this.isPlaying = true;
-                    }).catch(reject);
-                });
+                await this._playUrl(audioUrl);
             }
         } finally {
             if (resetFn) resetFn();
         }
     }
 
+    _playUrl(audioUrl) {
+        return new Promise((resolve, reject) => {
+            const audio = new Audio(audioUrl);
+            if (this._provider === 'local' && this.playbackSpeed !== 1) {
+                audio.playbackRate = this.playbackSpeed;
+            }
+            this.currentAudio = audio;
+            this._routeToAnalyser(audio);
+            audio.onended = () => {
+                this.isPlaying = false;
+                if (this.currentAudio === audio) this.currentAudio = null;
+                resolve();
+            };
+            audio.onerror = (e) => {
+                this.isPlaying = false;
+                if (this.currentAudio === audio) this.currentAudio = null;
+                reject(new Error('Audio playback error'));
+            };
+            audio.onpause = () => {
+                if (this.currentAudio !== audio) {
+                    resolve();
+                }
+            };
+            audio.play().then(() => {
+                this.isPlaying = true;
+            }).catch(reject);
+        });
+    }
+
+    /**
+     * Progressive playback: fetch `/api/tts/synthesize` with format "stream"
+     * and start playing PCM as it arrives, instead of waiting for the whole
+     * clip. The server (Chatterbox) emits a WAV header followed by PCM16 mono
+     * chunks, one per text chunk — each is scheduled as an AudioBufferSource
+     * back-to-back, routed through the shared analyser so the orb still
+     * reacts. Non-WAV bytes (e.g. an OpenAI endpoint returning mp3) are
+     * accumulated and played as a regular blob at the end. The assembled
+     * audio is cached under `cacheKey` for instant replay.
+     */
+    async _playStreamed(plainText, cacheKey, onStart = null) {
+        const ctx = this._ensureAudioGraph();
+        if (!ctx) throw new Error('Web Audio unavailable');
+
+        const response = await fetch('/api/tts/synthesize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: plainText, format: 'stream' })
+        });
+        if (!response.ok || !response.body) {
+            let msg = 'Synthesis failed';
+            try { msg = (await response.json()).detail?.message || msg; } catch {}
+            throw new Error(msg);
+        }
+
+        const reader = response.body.getReader();
+        const playback = {
+            cancelled: false,
+            sources: new Set(),
+            cancel: () => {
+                playback.cancelled = true;
+                try { reader.cancel(); } catch {}
+                for (const s of playback.sources) { try { s.stop(); } catch {} }
+                playback.sources.clear();
+            }
+        };
+        this._streamPlayback = playback;
+
+        const received = [];
+        let pre = new Uint8Array(0);   // bytes accumulated until the header is parsed
+        let headerParsed = false, wavMode = false, sampleRate = 0;
+        let carry = -1;                // odd trailing byte split across chunks
+        let nextTime = 0;
+        let streamEnded = false;
+        let started = false;
+        let finishResolve;
+        const finished = new Promise(r => { finishResolve = r; });
+        const maybeFinish = () => {
+            if (streamEnded && playback.sources.size === 0) finishResolve();
+        };
+
+        const schedule = (bytes) => {
+            let buf = bytes;
+            if (carry >= 0) {
+                const merged = new Uint8Array(buf.length + 1);
+                merged[0] = carry;
+                merged.set(buf, 1);
+                buf = merged;
+                carry = -1;
+            }
+            const usable = buf.length & ~1;
+            if (usable < buf.length) carry = buf[usable];
+            if (usable === 0) return;
+            const samples = new Int16Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + usable));
+            const audioBuf = ctx.createBuffer(1, samples.length, sampleRate);
+            const channel = audioBuf.getChannelData(0);
+            for (let i = 0; i < samples.length; i++) channel[i] = samples[i] / 32768;
+            const src = ctx.createBufferSource();
+            src.buffer = audioBuf;
+            src.connect(this._analyser);
+            playback.sources.add(src);
+            src.onended = () => { playback.sources.delete(src); maybeFinish(); };
+            // 40ms jitter floor for the first buffer; afterwards chunks butt up
+            // against the previous one's end so playback is gapless.
+            const startAt = Math.max(ctx.currentTime + 0.04, nextTime);
+            src.start(startAt);
+            nextTime = startAt + audioBuf.duration;
+            this.isPlaying = true;
+            if (!started) { started = true; if (onStart) onStart(); }
+        };
+
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done || playback.cancelled) break;
+                received.push(value);
+                if (!headerParsed) {
+                    const merged = new Uint8Array(pre.length + value.length);
+                    merged.set(pre);
+                    merged.set(value, pre.length);
+                    pre = merged;
+                    if (pre.length < 44) continue;
+                    wavMode = pre[0] === 0x52 && pre[1] === 0x49 && pre[2] === 0x46 && pre[3] === 0x46; // "RIFF"
+                    headerParsed = true;
+                    if (wavMode) {
+                        sampleRate = new DataView(pre.buffer, pre.byteOffset).getUint32(24, true);
+                        schedule(pre.subarray(44));
+                    }
+                    continue;
+                }
+                if (wavMode) schedule(value);
+            }
+        } finally {
+            streamEnded = true;
+        }
+
+        if (playback.cancelled) {
+            this.isPlaying = false;
+            if (this._streamPlayback === playback) this._streamPlayback = null;
+            return;
+        }
+
+        if (cacheKey && received.length) {
+            const blob = new Blob(received, { type: wavMode ? 'audio/wav' : 'audio/mpeg' });
+            this.cache.set(cacheKey, URL.createObjectURL(blob));
+        }
+
+        if (!wavMode) {
+            // Unknown container — play the fully-received bytes the normal way.
+            if (this._streamPlayback === playback) this._streamPlayback = null;
+            if (!received.length) throw new Error('Synthesis returned no audio');
+            if (onStart) onStart();
+            await this._playUrl(this.cache.get(cacheKey) ||
+                URL.createObjectURL(new Blob(received, { type: 'audio/mpeg' })));
+            return;
+        }
+
+        maybeFinish();
+        await finished;
+        this.isPlaying = false;
+        if (this._streamPlayback === playback) this._streamPlayback = null;
+    }
+
     // ── Streaming TTS (sentence-by-sentence) ──
 
     streamingStart() {
         this._streamSentencesSent = 0;
+        this._streamLatestText = '';
         this._streamActive = true;
         this._streamButton = null;
         this._streamResetFn = null;
+        this._streamFirstEmitted = false; // first spoken chunk may break on a clause
+    }
+
+    /**
+     * A new agent round (or teacher takeover) restarts the per-round text the
+     * caller feeds streamingUpdate — drop the spoken-offset counter and any
+     * pending debounce snapshot so offsets never index into the wrong text.
+     * Without this, the end-of-stream flush re-spoke earlier rounds.
+     */
+    streamingRoundReset() {
+        this._streamSentencesSent = 0;
+        this._streamLatestText = '';
+        if (this._streamDebounceTimer) {
+            clearTimeout(this._streamDebounceTimer);
+            this._streamDebounceTimer = null;
+        }
     }
 
     streamingUpdate(accumulatedText) {
         if (!this._streamActive || !this.available || !this.autoPlay) return;
+        // Always record the newest snapshot — the debounce timer processes
+        // this field, so a sentence boundary that arrives mid-window is
+        // synthesized when the timer fires instead of waiting for the next
+        // delta (which could be 60-120ms later, or never on stream end).
+        this._streamLatestText = accumulatedText;
         if (this._streamDebounceTimer) return;
+        // Short debounce so the first phrase reaches synthesis fast — this is
+        // part of the time-to-first-audio budget in conversation mode.
         this._streamDebounceTimer = setTimeout(() => {
             this._streamDebounceTimer = null;
-            this._processStreamingSentences(accumulatedText);
-        }, 150);
+            this._processStreamingSentences(this._streamLatestText);
+        }, 60);
     }
 
     _processStreamingSentences(accumulatedText) {
@@ -375,10 +668,16 @@ class AITTSManager {
             current += newRegion[i];
             var ch = newRegion[i];
             var next = newRegion[i + 1];
-            if ((ch === '.' || ch === '!' || ch === '?') && next && /\s/.test(next)) {
+            var isSentenceEnd = (ch === '.' || ch === '!' || ch === '?') && next && /\s/.test(next);
+            // Until the first chunk has been spoken, also break on a clause
+            // boundary (comma/semicolon/colon) so J.A.R.V.I.S starts talking on
+            // the opening phrase instead of waiting for a full sentence.
+            var isClauseEnd = !this._streamFirstEmitted &&
+                (ch === ',' || ch === ';' || ch === ':') && next && /\s/.test(next);
+            if (isSentenceEnd || isClauseEnd) {
                 var lastWord = current.trim().split(/\s/).pop() || '';
-                if (/^\d+\.$/.test(lastWord)) continue;
-                if (/^[A-Z][a-z]?\.$/.test(lastWord)) continue;
+                if (isSentenceEnd && /^\d+\.$/.test(lastWord)) continue;
+                if (isSentenceEnd && /^[A-Z][a-z]?\.$/.test(lastWord)) continue;
                 sentences.push(current.trim());
                 current = '';
             }
@@ -389,13 +688,17 @@ class AITTSManager {
         var advancedChars = 0;
         for (var j = 0; j < sentences.length; j++) {
             var sentence = sentences[j];
-            if (sentence.length < 15) {
+            // Lower the floor for the very first chunk so a short opening phrase
+            // ("Sure, ...") still gets spoken immediately.
+            var minLen = this._streamFirstEmitted ? 15 : 8;
+            if (sentence.length < minLen) {
                 advancedChars += sentence.length + 1;
                 continue;
             }
             var btn = this._streamButton || this._createPlaceholderButton();
             var resetFn = this._streamResetFn || function() {};
             this.enqueue(sentence, btn, resetFn);
+            this._streamFirstEmitted = true;
             advancedChars += sentence.length + 1;
         }
 

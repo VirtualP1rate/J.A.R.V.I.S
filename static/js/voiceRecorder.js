@@ -23,6 +23,32 @@ let _browserTranscript = '';
 // Cached STT provider — refreshed on settings change
 let _sttProvider = 'disabled';
 
+// Per-recording options (VAD, transcript callback). Reset on each start.
+let _opts = {};
+
+// Speculative early transcription (conversation mode): at ~half the VAD
+// silence window we snapshot the audio so far and start Whisper on it, so the
+// decode runs DURING the remaining endpoint wait instead of after it. If the
+// user resumes talking the speculation is discarded.
+let _specPending = false;   // requestData() issued, waiting for the chunk
+let _specPromise = null;    // in-flight speculative transcription (null on error)
+let _specValid = false;     // no speech heard since the speculation started
+
+// Voice Activity Detection state (for hands-free conversation mode). The
+// analyser watches the live mic level and auto-stops the recording after a
+// short trailing silence once speech has been detected.
+let _vadCtx = null;
+let _vadRaf = null;
+let _vadStopped = false;
+// Strong ref to the MediaStreamAudioSourceNode. Without this, Chrome
+// garbage-collects the unreferenced source node, silently disconnecting it from
+// the analyser so it reads flat silence (peak=0.000) even though ctx=running.
+let _vadSrc = null;
+// Cloned mic stream feeding the analyser. Chromium goes silent on the Web Audio
+// side when one track feeds both a MediaRecorder and a MediaStreamSource, so the
+// analyser taps an independent clone of the track instead.
+let _vadStream = null;
+
 /**
  * Fetch current STT provider from server settings
  */
@@ -53,7 +79,11 @@ function formatTime(seconds) {
  * Reset UI state after recording ends
  */
 function _resetRecordingUI() {
-  isRecording = false;
+  // Conversation mode can re-arm a NEW recorder before this (async) reset
+  // runs for the old one — don't mark the live recording as stopped.
+  if (!mediaRecorder || mediaRecorder.state !== 'recording') {
+    isRecording = false;
+  }
   if (recordingInterval) {
     clearInterval(recordingInterval);
     recordingInterval = null;
@@ -62,7 +92,14 @@ function _resetRecordingUI() {
   const sendBtn = document.querySelector('.send-btn');
   if (sendBtn) {
     sendBtn.classList.remove('recording');
-    sendBtn.dataset.mode = '';
+    // Only clear OUR state. In conversation mode the auto-submitted
+    // transcript has often already set mode='streaming' (chat.js), which
+    // voiceConversation._isStreaming() relies on — wiping it blinded the
+    // loop's stream detection and let the next utterance abort the
+    // in-flight response.
+    if (sendBtn.dataset.mode === 'recording') {
+      sendBtn.dataset.mode = '';
+    }
   }
   if (window._updateSendBtnIcon) {
     setTimeout(window._updateSendBtnIcon, 50);
@@ -146,9 +183,144 @@ function insertTranscription(text, showToast) {
 }
 
 /**
- * Start voice recording
+ * Compute RMS amplitude (0..1) from an analyser's time-domain data.
  */
-export function startRecording(onFileCreated, showToast, showError) {
+function _rms(analyser, buf) {
+  analyser.getByteTimeDomainData(buf);
+  let sum = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const v = (buf[i] - 128) / 128; // center on 0
+    sum += v * v;
+  }
+  return Math.sqrt(sum / buf.length);
+}
+
+/**
+ * Start Voice Activity Detection on a live mic stream. Auto-stops the
+ * recording after `silenceMs` of trailing silence once speech has been heard,
+ * or after `maxMs` as a hard cap. `onAutoStop(reason)` fires exactly once.
+ */
+function _startVad(stream, opts, onAutoStop) {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    _vadStopped = false;
+    _vadCtx = new AC();
+    // getUserMedia was awaited before we got here, which breaks the user-gesture
+    // chain — so the context can start 'suspended', and a suspended context's
+    // analyser only ever reports silence (VAD would never fire). Resume it.
+    if (_vadCtx.state === 'suspended') _vadCtx.resume();
+    // Tap an independent clone so the analyser doesn't fight the MediaRecorder
+    // for the same track (which makes the Web Audio side read pure silence).
+    _vadStream = (typeof stream.clone === 'function') ? stream.clone() : stream;
+    _vadSrc = _vadCtx.createMediaStreamSource(_vadStream);
+    const analyser = _vadCtx.createAnalyser();
+    analyser.fftSize = 512;
+    _vadSrc.connect(analyser);
+    const buf = new Uint8Array(analyser.fftSize);
+
+    const threshold = opts.vadThreshold != null ? opts.vadThreshold : 0.015;
+    const silenceMs = opts.silenceMs != null ? opts.silenceMs : 800;
+    const minSpeechMs = opts.minSpeechMs != null ? opts.minSpeechMs : 250;
+    const maxMs = opts.maxMs != null ? opts.maxMs : 20000;
+
+    const startedAt = performance.now();
+    let speechStart = 0;  // when the current above-threshold run began
+    let lastVoice = 0;    // last time we were above threshold
+    let speaking = false; // sustained speech confirmed
+    // Fire the speculative-transcribe callback partway into the silence
+    // window — late enough that most mid-sentence pauses have passed, early
+    // enough that the decode overlaps the remaining wait.
+    const specMs = Math.max(150, Math.min(silenceMs - 100, silenceMs / 2));
+    let specFired = false;
+
+    const fire = (reason) => {
+      if (_vadStopped) return;
+      _vadStopped = true;
+      console.log('[vad] endpoint:', reason, '(ctx=' + _vadCtx.state + ')');
+      onAutoStop(reason);
+    };
+
+    let _peak = 0, _logT = startedAt;
+    const tick = () => {
+      if (_vadStopped) return;
+      const rms = _rms(analyser, buf);
+      const now = performance.now();
+      // Periodic level log so we can see whether the analyser hears anything.
+      if (rms > _peak) _peak = rms;
+      if (now - _logT >= 1000) {
+        console.log('[vad] level peak=' + _peak.toFixed(3) + ' thr=' + threshold + ' speaking=' + speaking + ' ctx=' + _vadCtx.state);
+        _peak = 0; _logT = now;
+      }
+      if (rms > threshold) {
+        lastVoice = now;
+        if (specFired) {
+          // Speech resumed after a speculation started — it no longer covers
+          // the full utterance; discard it and allow a new one later.
+          specFired = false;
+          if (opts.onSpecInvalid) opts.onSpecInvalid();
+        }
+        if (!speaking) {
+          if (!speechStart) speechStart = now;
+          if (now - speechStart >= minSpeechMs) {
+            speaking = true;
+            if (opts.onStateChange) opts.onStateChange('speech');
+          }
+        }
+      } else if (!speaking) {
+        speechStart = 0; // partial blip — reset
+      }
+
+      if (speaking && !specFired && opts.onSpeculative && (now - lastVoice) >= specMs) {
+        specFired = true;
+        opts.onSpeculative();
+      }
+      if (speaking && (now - lastVoice) >= silenceMs) return fire('silence');
+      if (now - startedAt >= maxMs) return fire(speaking ? 'maxlen' : 'timeout');
+      _vadRaf = requestAnimationFrame(tick);
+    };
+    _vadRaf = requestAnimationFrame(tick);
+  } catch (e) {
+    console.warn('VAD init failed:', e);
+  }
+}
+
+function _stopVad() {
+  _vadStopped = true;
+  if (_vadRaf) {
+    cancelAnimationFrame(_vadRaf);
+    _vadRaf = null;
+  }
+  if (_vadSrc) {
+    try { _vadSrc.disconnect(); } catch (e) { /* ignore */ }
+    _vadSrc = null;
+  }
+  if (_vadCtx) {
+    try { _vadCtx.close(); } catch (e) { /* ignore */ }
+    _vadCtx = null;
+  }
+  // Stop the cloned analysis track (independent of the recording track).
+  if (_vadStream && _vadStream !== mediaRecorder?.stream) {
+    try { _vadStream.getTracks().forEach(t => t.stop()); } catch (e) { /* ignore */ }
+  }
+  _vadStream = null;
+}
+
+/**
+ * Start voice recording.
+ *
+ * @param {Function} onFileCreated  Called with a File when STT is disabled/failed.
+ * @param {Function} showToast      Toast helper.
+ * @param {Function} showError      Error helper.
+ * @param {Object}   [opts]         Conversation-mode options:
+ *   - vad {boolean}          enable silence-based auto-stop
+ *   - onTranscript {Function} called with the final transcript instead of
+ *                             inserting it into the composer (hands-free mode)
+ *   - onStateChange {Function} VAD state notifications ('speech')
+ *   - vadThreshold/silenceMs/minSpeechMs/maxMs  VAD tuning
+ */
+export function startRecording(onFileCreated, showToast, showError, opts = {}) {
+  _opts = opts || {};
   // Check for secure context (getUserMedia requires HTTPS or localhost)
   if (!window.isSecureContext) {
     if (showError) showError('Microphone requires HTTPS. Use a reverse proxy with SSL or access via localhost.');
@@ -163,56 +335,146 @@ export function startRecording(onFileCreated, showToast, showError) {
   }
 
   audioChunks = [];
+  _specPending = false;
+  _specPromise = null;
+  _specValid = false;
 
-  navigator.mediaDevices.getUserMedia({ audio: true })
-    .then(stream => {
+  const _handleMicError = (error) => {
+    _stopVad();
+    console.error('Microphone access error:', error);
+    // In conversation mode, report via onError so the controller exits the
+    // loop instead of re-listening forever on a permission failure.
+    if (_opts.onError) {
+      _opts.onError(error);
+      _resetRecordingUI();
+      return;
+    }
+    if (showError) {
+      if (error.name === 'NotAllowedError') {
+        showError('Microphone access denied. Check browser permissions.');
+      } else if (error.name === 'NotFoundError') {
+        showError('No microphone found.');
+      } else {
+        showError('Microphone error: ' + error.message);
+      }
+    }
+    _resetRecordingUI();
+  };
+
+  // `owned` is false when the caller supplies a persistent stream (conversation
+  // mode keeps one mic stream open across turns to avoid the ~100-300ms
+  // getUserMedia re-acquire cost on every turn). We must not stop its tracks.
+  const _onStream = (stream, owned) => {
+    try {
       mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+    } catch (e) {
+      _handleMicError(e);
+      return;
+    }
 
-      mediaRecorder.ondataavailable = event => {
-        if (event.data.size > 0) {
-          audioChunks.push(event.data);
-        }
+    mediaRecorder.ondataavailable = event => {
+      if (event.data.size > 0) {
+        audioChunks.push(event.data);
+      }
+      if (_specPending) {
+        // Chunk requested by the speculative path: everything captured so
+        // far forms a decodable webm (the first chunk carries the container
+        // header). Kick off Whisper now — the remaining silence window and
+        // the decode run concurrently.
+        _specPending = false;
+        _specValid = true;
+        const specBlob = new Blob(audioChunks, { type: 'audio/webm' });
+        _specPromise = transcribeOnServer(specBlob).catch(() => null);
+      }
+    };
+
+    // Speculative early transcription: only meaningful with VAD endpointing
+    // and a server-side STT provider (browser STT is already incremental).
+    const _serverStt = _sttProvider === 'local' || _sttProvider.startsWith('endpoint:');
+    if (_opts.vad && _serverStt) {
+      _opts.onSpeculative = () => {
+        if (!mediaRecorder || mediaRecorder.state !== 'recording') return;
+        _specPending = true;
+        try { mediaRecorder.requestData(); } catch (e) { _specPending = false; }
       };
+      _opts.onSpecInvalid = () => {
+        _specPromise = null;
+        _specValid = false;
+      };
+    }
 
-      mediaRecorder.onstop = async () => {
-        stream.getTracks().forEach(track => track.stop());
+    mediaRecorder.onstop = async () => {
+      _stopVad();
+      if (owned) stream.getTracks().forEach(track => track.stop());
 
-        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+      const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+        console.log('[rec] captured blob:', audioBlob.size, 'bytes from', audioChunks.length, 'chunks');
+        // Reset the recording UI BEFORE delivering the transcript:
+        // deliver() synchronously reaches handleChatSubmit, which sets
+        // mode='streaming' — resetting afterwards clobbered that state.
+        _resetRecordingUI();
         const provider = _sttProvider;
+        // Hands-free conversation mode routes the transcript to a callback
+        // instead of dropping it in the composer for the user to send.
+        const onTranscript = _opts.onTranscript;
+        const deliver = (text) => {
+          if (onTranscript) onTranscript((text || '').trim());
+          else insertTranscription(text, showToast);
+        };
 
         if (provider === 'browser') {
           const transcript = stopBrowserSTT();
           if (transcript) {
-            insertTranscription(transcript, showToast);
+            deliver(transcript);
+          } else if (onTranscript) {
+            onTranscript('');
           } else {
             if (showToast) showToast('No speech detected');
             const audioFile = new File([audioBlob], `voice-message-${Date.now()}.webm`, { type: 'audio/webm' });
             if (onFileCreated) onFileCreated(audioFile);
           }
         } else if (provider === 'local' || provider.startsWith('endpoint:')) {
-          // Show "Transcribing..." feedback
-          if (showToast) showToast('Transcribing...', 5000);
+          // Show "Transcribing..." feedback (skip in hands-free mode — the
+          // conversation UI shows its own state).
+          if (showToast && !onTranscript) showToast('Transcribing...', 5000);
           try {
-            const transcript = await transcribeOnServer(audioBlob);
+            let transcript = null;
+            if (_specPromise && _specValid) {
+              // The speculative decode covers the whole utterance (only
+              // silence followed it) and has been running since mid-window.
+              transcript = await _specPromise;
+              console.log('[stt] speculative transcript', transcript === null ? 'failed - falling back' : 'used');
+            }
+            _specPromise = null;
+            _specValid = false;
+            if (transcript === null || transcript === undefined) {
+              transcript = await transcribeOnServer(audioBlob);
+            }
             if (transcript) {
-              insertTranscription(transcript, showToast);
+              deliver(transcript);
+            } else if (onTranscript) {
+              onTranscript('');
             } else {
               if (showToast) showToast('No speech detected');
             }
           } catch (e) {
             console.error('STT transcription error:', e);
-            if (showError) showError('Transcription failed: ' + e.message);
-            // Fallback: attach as file
-            const audioFile = new File([audioBlob], `voice-message-${Date.now()}.webm`, { type: 'audio/webm' });
-            if (onFileCreated) onFileCreated(audioFile);
+            if (onTranscript) {
+              onTranscript('');
+            } else {
+              if (showError) showError('Transcription failed: ' + e.message);
+              // Fallback: attach as file
+              const audioFile = new File([audioBlob], `voice-message-${Date.now()}.webm`, { type: 'audio/webm' });
+              if (onFileCreated) onFileCreated(audioFile);
+            }
           }
+        } else if (onTranscript) {
+          onTranscript('');
         } else {
           // STT disabled — attach audio file
           const audioFile = new File([audioBlob], `voice-message-${Date.now()}.webm`, { type: 'audio/webm' });
           if (onFileCreated) onFileCreated(audioFile);
         }
-
-        _resetRecordingUI();
       };
 
       mediaRecorder.start();
@@ -224,23 +486,28 @@ export function startRecording(onFileCreated, showToast, showError) {
         startBrowserSTT();
       }
 
-      if (showToast) {
+      // Hands-free VAD: auto-stop on trailing silence.
+      if (_opts.vad) {
+        _startVad(stream, _opts, () => {
+          if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+        });
+      } else if (showToast) {
         showToast('Recording...');
       }
-    })
-    .catch(error => {
-      console.error('Microphone access error:', error);
-      if (showError) {
-        if (error.name === 'NotAllowedError') {
-          showError('Microphone access denied. Check browser permissions.');
-        } else if (error.name === 'NotFoundError') {
-          showError('No microphone found.');
-        } else {
-          showError('Microphone error: ' + error.message);
-        }
-      }
-      _resetRecordingUI();
-    });
+  };
+
+  // Reuse a caller-supplied persistent stream when present; otherwise acquire
+  // one. Echo cancellation + noise suppression keep the mic from re-capturing
+  // J.A.R.V.I.S's own TTS output (essential for barge-in in conversation mode).
+  if (_opts.stream) {
+    _onStream(_opts.stream, false);
+    return;
+  }
+  navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  })
+    .then(stream => _onStream(stream, true))
+    .catch(_handleMicError);
 }
 
 /**
@@ -251,6 +518,7 @@ export function stopRecording() {
     mediaRecorder.stop();
     // isRecording will be set to false in _resetRecordingUI called from onstop
   } else {
+    _stopVad();
     _resetRecordingUI();
   }
 }

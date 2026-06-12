@@ -32,8 +32,8 @@ export const THEMES = {
 };
 
 const DEFAULT_THEME = 'dark';
-const LS_KEY = 'odysseus-theme';
-const CUSTOM_THEMES_KEY = 'odysseus-custom-themes';
+const LS_KEY = 'jarvis-theme';
+const CUSTOM_THEMES_KEY = 'jarvis-custom-themes';
 
 const FONT_MAP = {
   mono: "'Fira Code', monospace",
@@ -183,7 +183,7 @@ const ADV_KEYS = [
   { key: 'aiBubbleBg',         css: '--ai-bubble-bg',      label: 'AI Chat Bubble',   group: 'Chat Bubbles' },
   { key: 'bubbleBorder',       css: '--bubble-border',     label: 'Border Chat Bubble', group: 'Chat Bubbles' },
   { key: 'sidebarBg',          css: '--sidebar-bg',        label: 'Sidebar Bg',       group: 'Sidebar' },
-  { key: 'brandColor',         css: '--brand-color',       label: 'Odysseus Logo',    group: 'Sidebar' },
+  { key: 'brandColor',         css: '--brand-color',       label: 'J.A.R.V.I.S Logo',    group: 'Sidebar' },
   { key: 'hamburgerColor',     css: '--hamburger-color',   label: 'Hamburger Menu',   group: 'Sidebar' },
   { key: 'inputBg',            css: '--input-bg',          label: 'Input Bg',         group: 'Chat Input / Prompt Area' },
   { key: 'inputBorder',        css: '--input-border',      label: 'Input Border',     group: 'Chat Input / Prompt Area' },
@@ -388,10 +388,10 @@ export function applyFontDensity(font, density) {
 const _BG_CLASSES = ['bg-pattern-dots',
   'bg-pattern-synapse', 'bg-pattern-rain', 'bg-pattern-constellations',
   'bg-pattern-perlin-flow',
-  'bg-pattern-petals', 'bg-pattern-sparkles', 'bg-pattern-embers'];
+  'bg-pattern-petals', 'bg-pattern-sparkles', 'bg-pattern-embers', 'bg-pattern-core'];
 const _CANVAS_PATTERNS = { synapse: _initSynapse, rain: _initRain, constellations: _initConstellations,
   'perlin-flow': _initPerlinFlow,
-  petals: _initPetals, sparkles: _initSparkles, embers: _initEmbers };
+  petals: _initPetals, sparkles: _initSparkles, embers: _initEmbers, core: _initCore };
 
 export function applyBgEffectColor(color) {
   document.documentElement.style.setProperty('--bg-effect-color', color || '');
@@ -429,7 +429,7 @@ export function applyBgPattern(pattern) {
   const p = pattern || 'none';
   document.body.classList.remove(..._BG_CLASSES);
   // Clean up any canvas backgrounds
-  document.querySelectorAll('#synapse-canvas, #rain-canvas, #constellations-canvas, #perlin-flow-canvas, #petals-canvas, #sparkles-canvas, #embers-canvas').forEach(c => c.remove());
+  document.querySelectorAll('#synapse-canvas, #rain-canvas, #constellations-canvas, #perlin-flow-canvas, #petals-canvas, #sparkles-canvas, #embers-canvas, #core-canvas').forEach(c => c.remove());
   if (p !== 'none') document.body.classList.add('bg-pattern-' + p);
   if (_CANVAS_PATTERNS[p]) _CANVAS_PATTERNS[p]();
   // Hide sliders that do nothing on static patterns.
@@ -1258,7 +1258,7 @@ export function initThemeUI() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'odysseus_' + (obj.name || 'theme') + '.json';
+      a.download = 'jarvis_' + (obj.name || 'theme') + '.json';
       a.click();
       URL.revokeObjectURL(url);
       newExp.innerHTML = '&#x2713; Downloaded!';
@@ -2038,6 +2038,417 @@ function _initEmbers() {
       }
     }
     ctx.globalCompositeOperation = 'source-over';
+  }
+  draw();
+}
+
+// ── Core — a holographic "JARVIS orb" that reacts to JARVIS's voice ──
+// A translucent teal energy sphere (modelled on the JARVIS app): an undulating
+// membrane of wavy concentric rim rings (radius perturbed by harmonics + Perlin
+// noise, vertically squashed so it reads as a tilted 3D orb), soft concentric
+// ripples expanding through it, and a slowly-rotating inner sphere of dots
+// placed on the Fibonacci lattice (even coverage) linked by a faint lattice —
+// all drawn with additive blending over a soft core glow. It breathes when idle
+// and surges (bigger, brighter, faster ripples) in time with TTS: it reads
+// window.aiTTSManager.getAudioLevel() (real audio RMS, 0..1) when available,
+// falling back to the boolean isPlaying flag when no stream is tappable (e.g.
+// the browser speechSynthesis path). Refs: Fibonacci sphere
+// (extremelearning.com.au), additive-blend particle glow (hakimel/Sphere).
+function _initCore() {
+  if (document.getElementById('core-canvas')) return;
+  const canvas = document.createElement('canvas');
+  canvas.id = 'core-canvas';
+  canvas.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:0;';
+  // Decorative background effect — hide from assistive tech so screen readers
+  // don't announce an empty canvas and axe's "region" rule doesn't flag it.
+  canvas.setAttribute('aria-hidden', 'true');
+  document.body.prepend(canvas);
+  const ctx = canvas.getContext('2d');
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const TAU = Math.PI * 2;
+  const SQUASH = 0.9;        // slight vertical squash → round orb with a touch of tilt
+  const GOLDEN = Math.PI * (3 - Math.sqrt(5)); // golden angle ≈ 2.39996 rad
+  let W, H, cx, cy, baseR, t = 0, energy = 0;
+  let nodes = [];            // inner dotted sphere (Fibonacci lattice unit vecs)
+  const ripples = [];        // expanding membrane ripples { life, maxLife }
+  let rippleTimer = 10;
+  let stream = [];           // glitchy data-stream glyphs riding the rings
+  const STREAM_CHARS = '0123456789ABCDEF<>/=*+#%:abcdef';
+  const waves = [];          // green voice-wave squiggles that spawn + fade out
+
+  function buildNodes() {
+    const N = W < 760 ? 180 : 280;
+    nodes = [];
+    for (let i = 0; i < N; i++) {
+      const by = 1 - (i / (N - 1)) * 2;            // y from +1 → -1
+      const rr = Math.sqrt(Math.max(0, 1 - by * by));
+      const th = GOLDEN * i;
+      nodes.push({ bx: Math.cos(th) * rr, by, bz: Math.sin(th) * rr,
+                   x: 0, y: 0, depth: 0 });
+    }
+  }
+  function buildStream() {
+    // Glyph slots distributed around three ring radii, alternating spin
+    // direction; each carries its own character + flicker state.
+    stream = [];
+    const RINGS = [0.9, 0.97, 1.04, 1.11, 1.18, 1.25, 1.32];
+    const PER = 44;
+    const N = STREAM_CHARS.length;
+    for (let r = 0; r < RINGS.length; r++) {
+      for (let i = 0; i < PER; i++) {
+        stream.push({ ang: (i / PER) * TAU + Math.random() * 0.05, ringMul: RINGS[r], dir: r % 2 ? -1 : 1,
+                      ch: STREAM_CHARS[(Math.random() * N) | 0], a: Math.random(),
+                      hue: Math.random() * 360, lum: 45 + Math.random() * 30 });
+      }
+    }
+  }
+  function resize() {
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    cx = W / 2; cy = H / 2;
+    baseR = Math.min(W, H) * 0.28;
+    buildNodes();
+    buildStream();
+  }
+  resize();
+  const _onResize = () => resize();
+  window.addEventListener('resize', _onResize);
+
+  function getColor() {
+    const s = getComputedStyle(document.documentElement);
+    return s.getPropertyValue('--bg-effect-color').trim() || s.getPropertyValue('--fg').trim() || '#9cdef2';
+  }
+  function getIntensity() {
+    const v = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--bg-effect-intensity'));
+    return isNaN(v) ? 1 : v;
+  }
+  let _rgbCache = '', _rgb = { r: 156, g: 222, b: 242 };
+  function rgbOf(hex) {
+    if (hex !== _rgbCache) { _rgbCache = hex; _rgb = hexToRgb(hex) || _rgb; }
+    return _rgb;
+  }
+  // Live voice level: real audio RMS when tappable, else a synthetic pulse while
+  // speaking, else 0. Smoothed by the caller into `energy`.
+  function voiceTarget() {
+    const tts = window.aiTTSManager;
+    if (!tts) return 0;
+    const lvl = typeof tts.getAudioLevel === 'function' ? tts.getAudioLevel() : 0;
+    if (lvl > 0.001) return Math.min(1, lvl * 1.8);
+    if (tts.isPlaying) return 0.45 + Math.sin(t * 0.18) * 0.25; // fallback pulse
+    return 0;
+  }
+
+  function draw() {
+    if (!document.body.classList.contains('bg-pattern-core')) {
+      window.removeEventListener('resize', _onResize); canvas.remove(); return;
+    }
+    requestAnimationFrame(draw);
+    t++;
+    energy += (voiceTarget() - energy) * 0.12; // smooth toward target
+    // Track the text-entry bar's horizontal centre so the orb stays aligned with
+    // the chat column when the sidebar/menu opens or a side panel narrows the view.
+    let _tx = W / 2;
+    const _bar = document.querySelector('.chat-input-bar');
+    if (_bar) { const r = _bar.getBoundingClientRect(); if (r.width > 0) _tx = r.left + r.width / 2; }
+    cx += (_tx - cx) * 0.12; // smooth follow
+    ctx.clearRect(0, 0, W, H);
+    const { r: cr, g: cg, b: cb } = rgbOf(getColor());
+    const rgba = (a) => `rgba(${cr},${cg},${cb},${a})`;
+    // Warm yellow-orange used for the molten core (independent of the theme
+    // colour, which drives the membrane / tendrils / nuclei).
+    const warm = (a) => `rgba(255,150,40,${a})`;
+    const lightRed = (a) => `rgba(255,120,120,${a})`;   // nucleus dots + lattice
+    const intensity = getIntensity();
+    const size = _getEffectSize();
+    const breath = Math.sin(t * 0.02) * 0.05;        // slow idle breathing
+    const surge = 1 + breath + energy * 0.35;         // overall scale factor (voice-reactive)
+    const R = baseR * size * surge;
+    // Calm radius — breathing only, no voice surge — for the nucleus + electrons
+    // so they stay steady while the rings/glyphs warble with the voice.
+    const Rcalm = baseR * size * (1 + breath);
+    ctx.globalCompositeOperation = 'lighter';
+
+    // Warm molten core glow (yellow-orange) lighting the centre of the orb.
+    const glowR = R * (0.7 + energy * 0.35);
+    const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, glowR);
+    g.addColorStop(0, `rgba(255,210,120,${(0.32 + energy * 0.3) * intensity})`);
+    g.addColorStop(0.3, warm((0.16 + energy * 0.2) * intensity));
+    g.addColorStop(0.7, warm((0.05 + energy * 0.08) * intensity));
+    g.addColorStop(1, warm(0));
+    ctx.fillStyle = g;
+    ctx.fillRect(cx - glowR, cy - glowR, glowR * 2, glowR * 2);
+
+    // 1. Concentric rim rings — kept crisp/near-circular (only a faint harmonic
+    //    breath) so the orb reads as a machined shell, not an organic membrane.
+    const amp = 0.28 + energy * 0.7;
+    const STEPS = 168;
+    for (let k = 0; k < 5; k++) {
+      const Ri = R * (0.86 + k * 0.06);
+      const seed = k * 2.1;
+      ctx.lineWidth = Math.max(0.8, (1.9 - k * 0.5) * size);
+      ctx.strokeStyle = rgba((0.18 + energy * 0.45) * (1 - k * 0.18) * intensity);
+      ctx.beginPath();
+      for (let s = 0; s <= STEPS; s++) {
+        const a = (s / STEPS) * TAU;
+        const w = 0.022 * Math.sin(6 * a + t * 0.03 + seed)
+                + 0.014 * Math.sin(10 * a - t * 0.045 + seed * 1.7);
+        // Fast high-frequency warble that only really shows when talking.
+        const rad = Ri * (1 + w * amp + Math.sin(9 * a + t * 0.24 + seed) * 0.055 * energy);
+        const x = cx + Math.cos(a) * rad;
+        const y = cy + Math.sin(a) * rad * SQUASH;
+        if (s) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+      }
+      ctx.closePath();
+      ctx.stroke();
+    }
+
+    // 1a. Mechanical HUD layer — segmented arc rings rotating at different rates
+    //     and a ring of gauge tick marks. This is what makes it read as a
+    //     machine/instrument rather than a cell.
+    const hud = [
+      { r: 1.04, segs: 3, gap: 0.45, rot: t * 0.006, w: 2.2 },
+      { r: 1.11, segs: 5, gap: 0.35, rot: -t * 0.0045, w: 1.5 },
+      { r: 1.18, segs: 7, gap: 0.3, rot: t * 0.005, w: 1.3 },
+      { r: 1.26, segs: 2, gap: 0.6, rot: -t * 0.003, w: 1.4 },
+      { r: 1.34, segs: 9, gap: 0.5, rot: t * 0.0035, w: 1.0 },
+    ];
+    for (const h of hud) {
+      const rr = R * h.r * (1 + Math.sin(t * 0.26 + h.r * 9) * 0.05 * energy);
+      ctx.lineWidth = Math.max(0.8, h.w * size);
+      ctx.strokeStyle = rgba((0.13 + energy * 0.45) * intensity);
+      const seg = TAU / h.segs;
+      for (let s = 0; s < h.segs; s++) {
+        const a0 = h.rot + s * seg;
+        ctx.beginPath();
+        ctx.ellipse(cx, cy, rr, rr * SQUASH, 0, a0, a0 + seg * (1 - h.gap));
+        ctx.stroke();
+      }
+    }
+    // Gauge ticks around the rim (every 4th one longer).
+    const TICKS = 96, trot = t * 0.0015;
+    ctx.lineWidth = Math.max(0.6, size);
+    ctx.strokeStyle = rgba((0.1 + energy * 0.4) * intensity);
+    for (let i = 0; i < TICKS; i++) {
+      const a = trot + (i / TICKS) * TAU;
+      const r1 = (i % 4 === 0 ? 1.05 : 1.01) * R * (1 + Math.sin(t * 0.3 + i) * 0.06 * energy);
+      const ca = Math.cos(a), sa = Math.sin(a);
+      ctx.beginPath();
+      ctx.moveTo(cx + ca * R * 0.97, cy + sa * R * 0.97 * SQUASH);
+      ctx.lineTo(cx + ca * r1, cy + sa * r1 * SQUASH);
+      ctx.stroke();
+    }
+
+    // 1c. Glitchy hex data-stream riding the rings — glyphs flicker, mutate and
+    //     blink out (intermittent gaps), with occasional bright glitch spikes.
+    ctx.font = `${Math.max(8, (9 * size) | 0)}px "Fira Code", monospace`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const srot = t * 0.004;
+    for (const d of stream) {
+      if (Math.random() < 0.1 + energy * 0.4) d.ch = STREAM_CHARS[(Math.random() * STREAM_CHARS.length) | 0]; // mutate (faster when talking)
+      if (Math.random() < 0.06) d.a = Math.random();                          // re-roll brightness
+      if (Math.random() < 0.03) d.hue = Math.random() * 360;                  // drift colour
+      const glitch = Math.random() < 0.03 + energy * 0.14;
+      if (!glitch && d.a < 0.32) continue;                                    // blink-out gaps
+      const a = d.ang + srot * d.dir + (Math.random() - 0.5) * 0.06 * energy;  // positional warble when talking
+      const rr = R * d.ringMul;
+      const x = cx + Math.cos(a) * rr;
+      const y = cy + Math.sin(a) * rr * SQUASH;
+      const al = (glitch ? 0.85 : 0.08 + d.a * 0.34) * (0.5 + energy * 1.0) * intensity;
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(a + Math.PI / 2);    // sit tangent to the ring
+      ctx.fillStyle = glitch ? `rgba(255,255,255,${al})` : `hsla(${d.hue | 0},85%,${d.lum | 0}%,${al})`;
+      ctx.fillText(d.ch, 0, 0);
+      ctx.restore();
+    }
+
+    // 1d. Green voice-waves — short wobbly waveform arcs that pop in bright at
+    //     random spots around the rings then fade out. Spawn faster when talking.
+    if (energy > 0.04 && Math.random() < 0.12 + energy * 0.4 && waves.length < 34) {
+      waves.push({ ca: Math.random() * TAU, ringMul: 0.94 + Math.random() * 0.42,
+                   aw: 0.22 + Math.random() * 0.45, life: 0, maxLife: 26 + Math.random() * 36,
+                   amp: 0.05 + Math.random() * 0.07, freq: 1.5 + Math.random() * 2.5,
+                   seed: Math.random() * 100 });
+    }
+    for (let i = waves.length - 1; i >= 0; i--) {
+      const wv = waves[i];
+      if (++wv.life > wv.maxLife) { waves.splice(i, 1); continue; }
+      const fade = 1 - wv.life / wv.maxLife;          // bright at spawn → fade out
+      ctx.lineWidth = Math.max(0.8, 1.6 * size);
+      ctx.lineJoin = 'round';
+      ctx.strokeStyle = `rgba(120,200,255,${fade * 0.7 * intensity})`;
+      ctx.beginPath();
+      const SEG = 40;
+      for (let s = 0; s <= SEG; s++) {
+        const tt = s / SEG;
+        const a = wv.ca + (tt - 0.5) * wv.aw;
+        const taper = Math.sin(Math.PI * tt);         // 0 at ends, 1 in middle
+        // Smooth, gently undulating waveform — low frequency + soft noise.
+        const wob = (Math.sin(tt * wv.freq * TAU + wv.life * 0.4 + wv.seed)
+                   + (_bgSmoothNoise(tt * 2.5 + wv.seed, wv.life * 0.06) - 0.5)) * wv.amp * taper;
+        const rr = R * wv.ringMul * (1 + wob);
+        const x = cx + Math.cos(a) * rr;
+        const y = cy + Math.sin(a) * rr * SQUASH;
+        if (s) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+      }
+      ctx.stroke();
+    }
+
+    // 1b. Reaching tendrils — energy filaments that grow out of the orb, curl
+    //     with noise and pulse in/out of different lengths so it feels alive.
+    //     Each is drawn segment-by-segment, tapering in width + alpha to a
+    //     glowing tip; they reach further and brighter with voice energy.
+    const NT = 30;
+    const TS = 16;
+    for (let i = 0; i < NT; i++) {
+      const seed = i * 12.9;
+      const baseAng = (i / NT) * TAU + Math.sin(t * 0.003 + seed) * 0.06;
+      // Per-tendril reach pulse (out of phase) + energy boost → living motion.
+      const reach = 0.5 + 0.5 * Math.sin(t * 0.018 + seed * 1.7);
+      const len = R * (0.95 + reach * 0.6 + energy * 0.9);
+      // Per-tendril random thickness — some chunky, some hair-thin.
+      const tw = 0.5 + (Math.sin(seed * 3.3) * 0.5 + 0.5) * 2.2;
+      const pts = [];
+      for (let s = 0; s <= TS; s++) {
+        const f = s / TS;
+        const rad = R * 0.14 + len * f;                          // start at the nucleus, reach outward
+        // Nearly straight conduits with only a slight sway (mechanical, not flagella).
+        const curl = (_bgSmoothNoise(seed + f * 3, t * 0.02 + seed) - 0.5) * (0.25 + energy * 0.4) * f;
+        const ang = baseAng + Math.sin(f * 2 + t * 0.02 + seed) * 0.06 * f + curl;
+        pts.push([cx + Math.cos(ang) * rad, cy + Math.sin(ang) * rad * SQUASH]);
+      }
+      for (let s = 0; s < TS; s++) {
+        const f = s / TS;
+        ctx.strokeStyle = warm((0.16 + energy * 0.22) * (1 - f * 0.85) * intensity);
+        ctx.lineWidth = Math.max(0.5, (1.7 - 1.3 * f) * tw * size);
+        ctx.beginPath();
+        ctx.moveTo(pts[s][0], pts[s][1]);
+        ctx.lineTo(pts[s + 1][0], pts[s + 1][1]);
+        ctx.stroke();
+      }
+      const tip = pts[TS];
+      ctx.fillStyle = warm((0.22 + energy * 0.4) * intensity);
+      ctx.beginPath(); ctx.arc(tip[0], tip[1], (0.9 + energy * 1.6) * size, 0, TAU); ctx.fill();
+      // Synapse-style pulses travelling out along the tendril (two, out of phase).
+      // Stagger each tendril's pulses with a per-tendril phase offset + speed
+      // so they don't march in lockstep.
+      const poff = Math.sin(seed * 12.9) * 0.5 + 0.5;
+      const psp = 0.009 + (Math.sin(seed * 4.1) * 0.5 + 0.5) * 0.013 + energy * 0.02;
+      for (let q = 0; q < 3; q++) {
+        const ph = (t * psp + poff + q * 0.34) % 1;
+        const fi = ph * TS, si = Math.min(TS - 1, fi | 0), fr = fi - si;
+        const px = pts[si][0] + (pts[si + 1][0] - pts[si][0]) * fr;
+        const py = pts[si][1] + (pts[si + 1][1] - pts[si][1]) * fr;
+        const pa = (0.5 + energy * 0.4) * (1 - ph * 0.4) * intensity;
+        ctx.fillStyle = warm(pa);
+        ctx.beginPath(); ctx.arc(px, py, (1.3 + energy * 1.6) * size, 0, TAU); ctx.fill();
+      }
+    }
+
+    // 2. Concentric ripples expanding out through the membrane.
+    if (--rippleTimer <= 0) { ripples.push({ life: 0, maxLife: 130 }); rippleTimer = Math.round(18 - energy * 10); }
+    ctx.lineWidth = Math.max(0.6, size);
+    for (let i = ripples.length - 1; i >= 0; i--) {
+      const rp = ripples[i];
+      if (++rp.life > rp.maxLife) { ripples.splice(i, 1); continue; }
+      const f = rp.life / rp.maxLife;
+      const rad = R * (0.2 + f * 0.78);
+      const al = Math.sin(Math.PI * f) * (0.13 + energy * 0.12) * intensity;
+      ctx.strokeStyle = rgba(al);
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, rad, rad * SQUASH, 0, 0, TAU);
+      ctx.stroke();
+    }
+
+    // 3. Inner dotted sphere — Fibonacci-lattice points, spun in 3D + projected.
+    const coreR = Rcalm * 0.2;
+    const nucPulse = 0.5 + 0.5 * Math.sin(t * 0.05);   // idle throb of the nucleus
+    const ay = t * 0.01, cay = Math.cos(ay), say = Math.sin(ay);
+    const ax = 0.62, cax = Math.cos(ax), sax = Math.sin(ax);
+    const FOCAL = 3;
+    for (const n of nodes) {
+      const rx = n.bx * cay + n.bz * say;
+      const rz = -n.bx * say + n.bz * cay;
+      const ry = n.by * cax - rz * sax;
+      const rz2 = n.by * sax + rz * cax;
+      const persp = FOCAL / (FOCAL - rz2);
+      n.x = cx + rx * coreR * persp;
+      n.y = cy + ry * coreR * persp * SQUASH;
+      n.depth = (rz2 + 1) / 2;          // 0 (back) .. 1 (front)
+    }
+    // Faint lattice links between nearby core dots → the "flower" grid feel.
+    const THR = coreR * 0.6, THR2 = THR * THR;
+    ctx.lineWidth = Math.max(0.5, 0.7 * size);
+    for (let i = 0; i < nodes.length; i++) {
+      const a = nodes[i];
+      for (let j = i + 1; j < nodes.length; j++) {
+        const b = nodes[j];
+        const ddx = a.x - b.x, ddy = a.y - b.y;
+        const d2 = ddx * ddx + ddy * ddy;
+        if (d2 >= THR2) continue;
+        const al = (1 - Math.sqrt(d2) / THR) * 0.09 * (0.3 + ((a.depth + b.depth) * 0.5) * 0.7) * (0.4 + 0.6 * nucPulse) * intensity;
+        if (al < 0.01) continue;
+        ctx.strokeStyle = lightRed(al);
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+      }
+    }
+    for (const n of nodes) {
+      // Translucent dots with a per-dot phase so the nucleus shimmers/pulses.
+      const pulse = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(t * 0.05 + n.by * 4));
+      const a = 0.24 * (0.2 + n.depth * 0.8) * pulse * intensity;
+      ctx.fillStyle = lightRed(a);
+      ctx.beginPath(); ctx.arc(n.x, n.y, (0.8 + n.depth * 1.1) * size, 0, TAU); ctx.fill();
+    }
+
+    // Electron orbits — Bohr-atom style: a few thin elliptical orbital rings at
+    // different rotations, each with one glowing electron gliding along the
+    // visible path (sized/brightened on the near side for depth). Drawing the
+    // ring is what turns the old "random whip" of dots into clean orbits.
+    const ORBITS = 5;
+    for (let i = 0; i < ORBITS; i++) {
+      const seed = i * 1.7;
+      const orot = (i / ORBITS) * Math.PI + t * 0.0008;   // fixed rotation + slow precession
+      const oa = Rcalm * (0.6 + 0.1 * i);                  // semi-major axis (calm, not voice-reactive)
+      const ob = oa * 0.34;                                // semi-minor (thin ellipse)
+      const co = Math.cos(orot), so = Math.sin(orot);
+      const proj = (th) => {
+        const ex = oa * Math.cos(th), ey = ob * Math.sin(th);
+        return [cx + (ex * co - ey * so), cy + (ex * so + ey * co) * SQUASH];
+      };
+      // The orbital ring itself.
+      ctx.lineWidth = Math.max(0.6, 0.9 * size);
+      ctx.strokeStyle = rgba(0.16 * intensity);
+      ctx.beginPath();
+      const ES = 84;
+      for (let s = 0; s <= ES; s++) { const p = proj((s / ES) * TAU); if (s) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]); }
+      ctx.closePath();
+      ctx.stroke();
+      // The electron travelling along it.
+      const eth = t * (0.02 + 0.005 * i) + seed;
+      const [ex, ey] = proj(eth);
+      const depth = (Math.sin(eth) + 1) / 2;               // near (1) / far (0)
+      const er = (1.8 + depth * 2.6) * size;
+      const ea = 0.65 * (0.4 + depth * 0.6) * intensity;
+      // Each electron's hue wanders as it zips around (noise-driven, per-orbit).
+      const hue = ((t * 0.6 + i * 67) + _bgSmoothNoise(seed, t * 0.01) * 200) % 360;
+      const ng = ctx.createRadialGradient(ex, ey, 0, ex, ey, er * 3);
+      ng.addColorStop(0, `hsla(${hue},90%,62%,${ea})`);
+      ng.addColorStop(1, `hsla(${hue},90%,62%,0)`);
+      ctx.fillStyle = ng;
+      ctx.fillRect(ex - er * 3, ey - er * 3, er * 6, er * 6);
+      ctx.fillStyle = `rgba(255,255,255,${ea})`;
+      ctx.beginPath(); ctx.arc(ex, ey, er * 0.5, 0, TAU); ctx.fill();
+    }
+
+    // Translucent molten centre that pulses with the nucleus.
+    const cpA = (0.15 + 0.35 * nucPulse) * intensity;
+    ctx.fillStyle = `rgba(255,230,170,${cpA})`;
+    ctx.beginPath(); ctx.arc(cx, cy, R * (0.045 + 0.02 * nucPulse), 0, TAU); ctx.fill();
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
   }
   draw();
 }

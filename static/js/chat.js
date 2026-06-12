@@ -222,7 +222,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       // Clear any pending transitions from + → arrow swap
       submitBtn.classList.remove('anim-spin', 'anim-spin-swap', 'anim-land', 'mic-mode', 'newchat-mode', 'newchat-expanded', 'recording');
       // Ensure arrow icon is showing before launch
-      var icons = window._odysseusBtnIcons;
+      var icons = window._jarvisBtnIcons;
       if (icons) submitBtn.innerHTML = icons.send;
       void submitBtn.offsetWidth;
       // Arrow launches up, then stop icon lands in
@@ -253,7 +253,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       if (window._updateSendBtnIcon) {
         setTimeout(window._updateSendBtnIcon, 50);
       } else {
-        var icons = window._odysseusBtnIcons;
+        var icons = window._jarvisBtnIcons;
         submitBtn.innerHTML = icons ? icons.send : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
         submitBtn.title = 'Send message';
         submitBtn.classList.remove('mic-mode', 'newchat-mode');
@@ -486,10 +486,10 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
           const dcRes = await fetch('/api/default-chat');
           dc = await dcRes.json();
           if (dc && dc.endpoint_url && dc.model) {
-            try { window.__odysseusDefaultChat = dc; } catch (_) {}
+            try { window.__jarvisDefaultChat = dc; } catch (_) {}
           }
         } catch (_) {
-          dc = (typeof window !== 'undefined' && window.__odysseusDefaultChat) || null;
+          dc = (typeof window !== 'undefined' && window.__jarvisDefaultChat) || null;
         }
         if (dc.endpoint_url && dc.model) {
           await sessionModule.createDirectChat(dc.endpoint_url, dc.model, dc.endpoint_id);
@@ -547,7 +547,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
 
     // Acquire Web Lock to hint browser not to discard this tab while streaming
     if (navigator.locks) {
-      navigator.locks.request('odysseus-stream-' + streamSessionId, { mode: 'exclusive', ifAvailable: true }, lock => {
+      navigator.locks.request('jarvis-stream-' + streamSessionId, { mode: 'exclusive', ifAvailable: true }, lock => {
         if (!lock) return; // Another stream already holds a lock — fine
         return new Promise(resolve => { _webLockRelease = resolve; });
       }).catch(e => console.warn('web lock acquire failed:', e)); // Ignore lock errors — best-effort
@@ -2462,7 +2462,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                   newBody.appendChild(spinner.createElement());
                   spinner.start();
                 }
-                if (streamingTTS) window.aiTTSManager._streamSentencesSent = 0;
+                if (streamingTTS) window.aiTTSManager.streamingRoundReset();
                 uiModule.scrollHistory();
               } else if (json.type === 'budget_exceeded') {
                 if (_isBg) continue;
@@ -2494,6 +2494,9 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 roundText = '';
                 roundFinalized = false;
                 currentToolBubble = null;
+                // The TTS spoken-offset counter indexes into roundText — reset
+                // it with the text or the teacher's reply gets mis-offset.
+                if (streamingTTS) window.aiTTSManager.streamingRoundReset();
                 uiModule.scrollHistory();
 
               } else if (json.type === 'skill_saved') {
@@ -2731,7 +2734,11 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
         }
         // TTS auto-play: streaming mode flushes remaining text, non-streaming enqueues full message
         if (accumulated && window.aiTTSManager && window.aiTTSManager.autoPlay) {
-          const ttsBtn = holder.querySelector('.ai-tts-button');
+          // The button was added to footerTarget (the last visible bubble) —
+          // on a multi-round agent reply that is roundHolder, NOT holder.
+          // Querying holder found nothing, skipped streamingEnd, and left
+          // _streamActive set — wedging conversation mode in "speaking".
+          const ttsBtn = footerTarget.querySelector('.ai-tts-button');
           if (ttsBtn) {
             var ICON_PLAY_TTS = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="6 3 20 12 6 21 6 3"/></svg>';
             var ICON_STOP_TTS = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>';
@@ -2742,8 +2749,11 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
               ttsBtn.title = 'Read aloud';
             };
             if (streamingTTS) {
-              // Flush remaining partial sentence and attach the real button
-              window.aiTTSManager.streamingEnd(accumulated);
+              // Flush remaining partial sentence and attach the real button.
+              // Per-round text, NOT the multi-round `accumulated` — the spoken
+              // offset counter tracks roundText (streamingUpdate above), so
+              // flushing `accumulated` re-spoke every earlier agent round.
+              window.aiTTSManager.streamingEnd(roundText);
               window.aiTTSManager.streamingAttachButton(ttsBtn, resetFn);
               // If still playing sentences from the stream, show stop icon
               if (window.aiTTSManager.isPlaying || window.aiTTSManager._processing) {
@@ -2829,8 +2839,9 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
           }
         }
       } else {
-        // Stop streaming TTS on any error/abort
-        if (streamingTTS && window.aiTTSManager) window.aiTTSManager.stop();
+        // Stop streaming TTS on any error/abort. (`streamingTTS` from the happy
+        // path isn't in scope in this error branch — check the manager directly.)
+        if (window.aiTTSManager && window.aiTTSManager.autoPlay) window.aiTTSManager.stop();
 
         if (currentAbort && currentAbort.signal.aborted) {
           const abortReason = currentAbort._reason || '';
@@ -2975,6 +2986,16 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
         }
       }
     } finally {
+      // Close the streaming-TTS session on EVERY exit — success, error, or
+      // abort. The happy path flushes the remainder via streamingEnd above
+      // (idempotent: _streamActive gates re-entry); error/abort paths never
+      // reached it, leaving _streamActive set, which reads as "TTS busy"
+      // forever and wedges conversation mode in "speaking". Only manager
+      // state is referenced here — streamingTTS/roundText are declared
+      // inside the try and are not in scope.
+      if (window.aiTTSManager && window.aiTTSManager._streamActive) {
+        try { window.aiTTSManager.streamingEnd(''); } catch (_e) { /* ignore */ }
+      }
       clearResponseTimeout();
       clearProcessingProbe();
       // Streaming done — let screen readers announce the settled response.
@@ -3048,7 +3069,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
             if (_box && sessionModule.getCurrentSessionId() === _timeoutSessionId) {
               var _timeoutMsg = document.createElement('div');
               _timeoutMsg.className = 'msg msg-ai';
-              _timeoutMsg.innerHTML = '<div class="role">Odysseus</div><div class="body" style="opacity:0.6;font-style:italic;">Research clarification timed out. Toggle research again to start over.</div>';
+              _timeoutMsg.innerHTML = '<div class="role">J.A.R.V.I.S</div><div class="body" style="opacity:0.6;font-style:italic;">Research clarification timed out. Toggle research again to start over.</div>';
               _box.appendChild(_timeoutMsg);
               uiModule.scrollHistory();
             }
@@ -4945,7 +4966,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
   // streaming, history-rendered, compare-mode, all of them. Re-attaching
   // per-node listeners on every innerHTML rewrite was the source of the
   // "needs many clicks" bug.
-  if (!window.__odysseus_thread_click_bound) {
+  if (!window.__jarvis_thread_click_bound) {
     document.body.addEventListener('click', (e) => {
       const header = e.target.closest('.agent-thread-header');
       if (!header) return;
@@ -4953,7 +4974,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       if (!node) return;
       node.classList.toggle('open');
     });
-    window.__odysseus_thread_click_bound = true;
+    window.__jarvis_thread_click_bound = true;
   }
 
   export default chatModule;

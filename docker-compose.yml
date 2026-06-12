@@ -1,19 +1,19 @@
 services:
-  odysseus:
+  jarvis:
     build: .
     ports:
       - "${APP_BIND:-127.0.0.1}:${APP_PORT:-7000}:7000"
     volumes:
       - ./data:/app/data:z
       - ./logs:/app/logs:z
-      # Cookbook remote-server SSH identity. Odysseus can generate a key here;
+      # Cookbook remote-server SSH identity. J.A.R.V.I.S can generate a key here;
       # add the shown public key to each remote server's authorized_keys.
       - ./data/ssh:/app/.ssh:z
-      # Cookbook local model cache. Inside Docker, "Local" means the Odysseus
+      # Cookbook local model cache. Inside Docker, "Local" means the J.A.R.V.I.S
       # container, so persist its HuggingFace cache under ./data/huggingface.
       - ./data/huggingface:/app/.cache/huggingface:z
       # Cookbook-installed Python CLIs/packages (vLLM, llama-cpp-python, etc.)
-      # land under /app/.local for the odysseus user. Persist them so a
+      # land under /app/.local for the jarvis user. Persist them so a
       # container recreate does not silently remove installed serve engines.
       - ./data/local:/app/.local:z
     extra_hosts:
@@ -34,8 +34,8 @@ services:
       - DATABASE_URL=${DATABASE_URL:-sqlite:///./data/app.db}
       - AUTH_ENABLED=${AUTH_ENABLED:-true}
       - LOCALHOST_BYPASS=${LOCALHOST_BYPASS:-false}
-      - ODYSSEUS_ADMIN_USER=${ODYSSEUS_ADMIN_USER:-admin}
-      - ODYSSEUS_ADMIN_PASSWORD=${ODYSSEUS_ADMIN_PASSWORD:-}
+      - JARVIS_ADMIN_USER=${JARVIS_ADMIN_USER:-admin}
+      - JARVIS_ADMIN_PASSWORD=${JARVIS_ADMIN_PASSWORD:-}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost,http://127.0.0.1}
       - SECURE_COOKIES=${SECURE_COOKIES:-false}
       - EMBEDDING_URL=${EMBEDDING_URL:-}
@@ -44,10 +44,10 @@ services:
       - FASTEMBED_MODEL=${FASTEMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
       - FASTEMBED_CACHE_PATH=${FASTEMBED_CACHE_PATH:-}
       - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS:-24}
-      - ODYSSEUS_INPROCESS_POLLERS=${ODYSSEUS_INPROCESS_POLLERS:-1}
-      - ODYSSEUS_INPROCESS_TASKS=${ODYSSEUS_INPROCESS_TASKS:-1}
-      - ODYSSEUS_SCRIPT_HOST=${ODYSSEUS_SCRIPT_HOST:-localhost}
-      - ODYSSEUS_CHAT_UPLOAD_MAX_BYTES=${ODYSSEUS_CHAT_UPLOAD_MAX_BYTES:-10485760}
+      - JARVIS_INPROCESS_POLLERS=${JARVIS_INPROCESS_POLLERS:-1}
+      - JARVIS_INPROCESS_TASKS=${JARVIS_INPROCESS_TASKS:-1}
+      - JARVIS_SCRIPT_HOST=${JARVIS_SCRIPT_HOST:-localhost}
+      - JARVIS_CHAT_UPLOAD_MAX_BYTES=${JARVIS_CHAT_UPLOAD_MAX_BYTES:-10485760}
       - DATA_BRAVE_API_KEY=${DATA_BRAVE_API_KEY:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
       - GOOGLE_PSE_CX=${GOOGLE_PSE_CX:-}
@@ -68,6 +68,125 @@ services:
         condition: service_healthy
       chromadb:
         condition: service_started
+      chatterbox:
+        condition: service_started
+      whisper:
+        condition: service_started
+      llamacpp:
+        condition: service_started
+    restart: unless-stopped
+
+  # Chatterbox (Resemble AI) text-to-speech. A small FastAPI wrapper we own
+  # (services/chatterbox) around the official MIT `chatterbox-tts` library,
+  # exposing an OpenAI-compatible /v1/audio/speech endpoint. J.A.R.V.I.S talks
+  # to it as a model endpoint: TTS provider "endpoint:<id>" -> base_url
+  # http://chatterbox:8004/v1. It clones the reference clip in ./data/chatterbox_voices.
+  # DEVICE=auto runs on CPU here for portability; the NVIDIA overlay
+  # (docker/gpu.nvidia.yml) sets DEVICE=cuda and reserves the GPU.
+  chatterbox:
+    build: ./services/chatterbox
+    ports:
+      - "${CHATTERBOX_BIND:-127.0.0.1}:8004:8004"
+    volumes:
+      - ./data/chatterbox_voices:/voices:ro
+      - chatterbox-hf-cache:/root/.cache/huggingface
+    environment:
+      # No DEVICE here: the image defaults to auto (cuda if available, else cpu);
+      # the NVIDIA overlay appends DEVICE=cuda. Keeps base portable and lets the
+      # standalone GPU files equal base + overlay exactly.
+      - CHATTERBOX_MODEL=${CHATTERBOX_MODEL:-standard}
+      - DEFAULT_VOICE=${CHATTERBOX_DEFAULT_VOICE:-jarvis}
+      - EXAGGERATION=${CHATTERBOX_EXAGGERATION:-0.5}
+      - CFG_WEIGHT=${CHATTERBOX_CFG_WEIGHT:-0.5}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8004/health', timeout=5).read(1)\""]
+      interval: 15s
+      timeout: 6s
+      retries: 20
+      start_period: 120s
+    restart: unless-stopped
+
+  # faster-whisper (CTranslate2) speech-to-text. A small FastAPI wrapper we own
+  # (services/whisper) exposing an OpenAI-compatible /v1/audio/transcriptions
+  # endpoint. J.A.R.V.I.S talks to it as a model endpoint: STT provider
+  # "endpoint:whisper-stt" -> base_url http://whisper:8005/v1. The model is
+  # warmed at startup so the first turn isn't slow. DEVICE=auto runs on CPU here
+  # for portability; the NVIDIA overlay (docker/gpu.nvidia.yml) sets DEVICE=cuda
+  # and reserves the GPU (large-v3-turbo transcribes a short turn in well under
+  # a second on the RTX 3090).
+  whisper:
+    build: ./services/whisper
+    ports:
+      - "${WHISPER_BIND:-127.0.0.1}:8005:8005"
+    volumes:
+      - whisper-hf-cache:/root/.cache/huggingface
+    environment:
+      - WHISPER_MODEL=${WHISPER_MODEL:-large-v3-turbo}
+      # Greedy decoding (beam 1) — short conversational turns lose almost no
+      # accuracy vs beam 5 and decode ~2-3x faster, which sits directly in the
+      # end-of-speech -> first-audio critical path.
+      - BEAM_SIZE=${WHISPER_BEAM_SIZE:-1}
+      - VAD_FILTER=${WHISPER_VAD_FILTER:-1}
+      - DEFAULT_LANGUAGE=${WHISPER_LANGUAGE:-en}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8005/health', timeout=5).read(1)\""]
+      interval: 15s
+      timeout: 6s
+      retries: 20
+      start_period: 120s
+    restart: unless-stopped
+
+  # llama.cpp LLM server (official CUDA image). Serves the local GGUF over an
+  # OpenAI-compatible API on :8888 so J.A.R.V.I.S talks to it container-to-
+  # container at http://llamacpp:8888/v1 (replaces running llama-server on the
+  # host). The model is bind-mounted from the host folder set in .env
+  # (LLAMA_MODELS_DIR); GPU passthrough + full offload come from the nvidia
+  # overlay (docker/gpu.nvidia.yml). Flags are env-overridable so you can tune
+  # ctx/offload without editing this file.
+  llamacpp:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    ports:
+      - "${LLAMA_BIND:-127.0.0.1}:8888:8888"
+    volumes:
+      - "${LLAMA_MODELS_DIR:?set LLAMA_MODELS_DIR in .env to your GGUF folder}:/models:ro"
+    command:
+      - "-m"
+      - "/models/${LLAMA_MODEL:-google_gemma-4-26B-A4B-it-IQ4_XS.gguf}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8888"
+      - "--n-gpu-layers"
+      - "${LLAMA_NGL:-999}"
+      # 16k context with a q8_0-quantized KV cache costs about the same VRAM
+      # as the old 8k fp16 cache (the GPU sits at ~23.7/24.6 GB with whisper +
+      # chatterbox loaded, so there is no headroom for an fp16 16k cache).
+      # q8_0 KV is community-consensus lossless for chat; V-cache quantization
+      # requires flash attention, hence --flash-attn on.
+      - "--ctx-size"
+      - "${LLAMA_CTX:-16384}"
+      - "--cache-type-k"
+      - "${LLAMA_CACHE_TYPE_K:-q8_0}"
+      - "--cache-type-v"
+      - "${LLAMA_CACHE_TYPE_V:-q8_0}"
+      - "--flash-attn"
+      - "${LLAMA_FLASH_ATTN:-on}"
+      - "--parallel"
+      - "${LLAMA_PARALLEL:-1}"
+      # Expose /slots so J.A.R.V.I.S can read the true serving context
+      # (model_context.py probes /props, then /slots).
+      - "--slots"
+      - "--jinja"
+      # Reasoning/thinking budget: 0 = no thinking (immediate answer) for snappy
+      # voice replies; set LLAMA_REASONING_BUDGET=-1 to re-enable unrestricted.
+      - "--reasoning-budget"
+      - "${LLAMA_REASONING_BUDGET:-0}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8888/health || exit 1"]
+      interval: 15s
+      timeout: 6s
+      retries: 30
+      start_period: 180s
     restart: unless-stopped
 
   chromadb:
@@ -81,7 +200,7 @@ services:
     restart: unless-stopped
 
   searxng:
-    # Pinned, not :latest — odysseus waits on searxng's healthcheck
+    # Pinned, not :latest — jarvis waits on searxng's healthcheck
     # (depends_on: condition: service_healthy), so a broken upstream `latest`
     # tag blocks the whole app from starting. 2026.6.2 crashes on boot with
     # `KeyError: 'default_doi_resolver'`, failing the healthcheck (issue #1414).
@@ -92,7 +211,7 @@ services:
       - -c
       - |
         set -eu
-        if [ ! -s /etc/searxng/settings.yml ] || grep -q 'odysseus-local-searxng-json-2026-05-30\|__SEARXNG_SECRET__' /etc/searxng/settings.yml; then
+        if [ ! -s /etc/searxng/settings.yml ] || grep -q 'jarvis-local-searxng-json-2026-05-30\|__SEARXNG_SECRET__' /etc/searxng/settings.yml; then
           secret="$${SEARXNG_SECRET:-}"
           if [ -z "$$secret" ]; then
             secret="$$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
@@ -145,3 +264,5 @@ volumes:
   searxng-data:
   chromadb-data:
   ntfy-cache:
+  chatterbox-hf-cache:
+  whisper-hf-cache:

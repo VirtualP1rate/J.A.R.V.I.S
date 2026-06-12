@@ -1,0 +1,7 @@
+# Chatterbox TTS server deps. torch==2.6.0 / torchaudio==2.6.0 (cu124) come from
+# the base image (see Dockerfile); chatterbox-tts==0.1.7 pins exactly those.
+chatterbox-tts==0.1.7
+fastapi
+uvicorn[standard]
+soundfile
+numpy<2.0

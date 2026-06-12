@@ -213,8 +213,8 @@ def build_headers(api_key: Optional[str], base: str) -> Dict[str, str]:
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     if provider == "openrouter":
-        headers.setdefault("HTTP-Referer", "https://github.com/pewdiepie-archdaemon/odysseus")
-        headers.setdefault("X-OpenRouter-Title", "Odysseus")
+        headers.setdefault("HTTP-Referer", "https://github.com/pewdiepie-archdaemon/jarvis")
+        headers.setdefault("X-OpenRouter-Title", "J.A.R.V.I.S")
     return headers
 
 
@@ -238,14 +238,29 @@ def resolve_endpoint(
         (endpoint_url, model, headers) — resolved or fallback values.
     """
     try:
-        from src.settings import get_user_setting, load_settings
+        from src.settings import load_settings, _PER_USER_KEYS
         settings = load_settings()
     except Exception:
         return fallback_url, fallback_model, fallback_headers
 
     owner_str = owner or ""
+    # Load the caller's per-user prefs ONCE — the keys below resolve up to 6
+    # settings, and get_user_setting would re-read the prefs file on each one.
+    # Same merge semantics: a set, non-empty per-user value wins, else global.
+    _user_prefs = {}
+    if owner_str:
+        try:
+            from routes.prefs_routes import _load_for_user
+            _user_prefs = _load_for_user(owner_str) or {}
+        except Exception:
+            _user_prefs = {}
+
     def _stg(key: str) -> str:
-        return (get_user_setting(key, owner_str, settings.get(key, "")) or "").strip()
+        if owner_str and key in _PER_USER_KEYS:
+            v = _user_prefs.get(key)
+            if v not in (None, ""):
+                return (v or "").strip()
+        return (settings.get(key, "") or "").strip()
 
     ep_id = _stg(f"{setting_prefix}_endpoint_id")
     model = _stg(f"{setting_prefix}_model")
