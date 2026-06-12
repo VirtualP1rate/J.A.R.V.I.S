@@ -308,8 +308,15 @@ async def maybe_compact(
     messages: List[Dict],
     headers: Optional[Dict] = None,
     owner: Optional[str] = None,
+    preface_count: int = 0,
 ) -> tuple:
     """Check context usage and compact if above threshold.
+
+    `messages` is the full request list; its first `preface_count` entries are
+    per-request preface (security policy, memories, RAG, web results) that do
+    NOT exist in session.history. Only history-derived messages are summarized
+    — splitting the combined list used to make the history deletion in
+    _update_session_history overshoot and destroy unsummarized turns.
 
     Returns (messages, context_length, was_compacted).
     """
@@ -324,16 +331,24 @@ async def maybe_compact(
         f"Context at {pct:.1f}% ({used}/{context_length} tokens) — compacting"
     )
 
-    # Split into system preface and conversation
+    preface = list(messages[:preface_count])
+    history_msgs = messages[preface_count:]
+
+    # Split the history-derived messages into system (prior summaries etc.)
+    # and conversation. The preface stays out of the split entirely: it is
+    # rebuilt fresh every request, so summarizing it wastes the summary on
+    # content that reappears next turn anyway.
     system_msgs = []
     convo_msgs = []
-    for msg in messages:
+    for msg in history_msgs:
         if msg.get("role") == "system":
             system_msgs.append(msg)
         else:
             convo_msgs.append(msg)
 
     if len(convo_msgs) < 4:
+        # Not enough history to halve — trim_for_context handles the length
+        # (an oversized preface alone can trip the threshold).
         return messages, context_length, False
 
     # Split conversation: summarize older half, keep recent half
@@ -391,14 +406,10 @@ async def maybe_compact(
         "content": f"[Conversation summary — earlier messages were compacted]\n{summary}",
     }
 
-    compacted = system_msgs + [summary_msg] + recent
+    compacted = preface + system_msgs + [summary_msg] + recent
 
-    # Update session history to match. Pass len(system_msgs) so the
-    # recent_history slice in _update_session_history uses the correct
-    # offset — session.history INCLUDES the system messages, but
-    # split_point is indexed against convo_msgs which does NOT. Without
-    # this, the slice drops the leading system message(s).
-    _update_session_history(session, split_point, summary, system_msg_count=len(system_msgs))
+    # Remove exactly the summarized messages from the persisted history.
+    _update_session_history(session, split_point, summary)
 
     new_used = estimate_tokens(compacted)
     logger.info(
@@ -409,34 +420,55 @@ async def maybe_compact(
     return compacted, context_length, True
 
 
-def _update_session_history(session, split_point: int, summary: str,
-                            system_msg_count: int = 0):
-    """Update the in-memory session history after compaction.
+def _update_session_history(session, split_point: int, summary: str):
+    """Replace the summarized messages in session.history with the summary.
 
-    `split_point` is the index in `convo_msgs` (system-stripped). The
-    in-memory `session.history` includes leading system messages, so the
-    actual recent-history slice starts at `system_msg_count + split_point`.
-    Prepending `session.history[:system_msg_count]` to the new history
-    preserves persona, preset, and RAG system messages that would
-    otherwise be dropped.
+    `split_point` counts conversational messages exactly as the compaction
+    split saw them: the non-system entries of get_context_messages(), which
+    skips metadata.source == "slash" UI chatter (core/models.py). Walk the
+    history with that same filter and drop precisely the first `split_point`
+    such messages, keeping system and slash messages where they sit. Mapping
+    by re-applying the filter — instead of index arithmetic against the
+    request list, which also contains per-request preface messages that are
+    NOT in history — is what guarantees no unsummarized turn is deleted
+    (replace_messages below is permanent).
     """
-    if not session or not hasattr(session, "history"):
+    if not session or not hasattr(session, "history") or split_point <= 0:
         return
 
-    effective_split = system_msg_count + split_point
-    if effective_split >= len(session.history):
-        return
-
-    # Keep the recent messages, prepend summary AND the leading system
-    # messages so the system prompt survives compaction.
-    system_prefix = list(session.history[:system_msg_count])
-    recent_history = session.history[effective_split:]
     summary_msg = ChatMessage(
         role="system",
         content=f"[Conversation summary]\n{summary}",
         metadata={"compacted": True, "summarized_count": split_point},
     )
-    new_history = system_prefix + [summary_msg] + recent_history
+    new_history = []
+    dropped = 0
+    for msg in session.history:
+        is_convo = (
+            getattr(msg, "role", "") != "system"
+            and (getattr(msg, "metadata", None) or {}).get("source") != "slash"
+        )
+        if is_convo and dropped < split_point:
+            dropped += 1
+            if dropped == split_point:
+                # The summary takes the place of the block it summarizes, so
+                # prior system messages (persona, earlier summaries) stay
+                # ahead of it in their original order.
+                new_history.append(summary_msg)
+            continue
+        new_history.append(msg)
+
+    if dropped < split_point:
+        # History has fewer conversational messages than were summarized —
+        # the request list disagrees with the session (shouldn't happen, but
+        # deleting on a mismatch is exactly the bug this rewrite removes).
+        logger.warning(
+            "Compaction split (%d) exceeds history conversational messages (%d) "
+            "for session %s — leaving history untouched",
+            split_point, dropped, getattr(session, "id", "?"),
+        )
+        return
+
     try:
         from core import models as _core_models
         manager = getattr(_core_models, "_session_manager", None)
