@@ -65,6 +65,8 @@ output.txt.txt
 !docs/*.jpg
 !docs/*.jpeg
 !docs/*.png
+# …and the PWA icons the manifest + apple-touch-icon point at.
+!static/icon-*.png
 !docs/*.gif
 !docs/*.webp
 # …and curated docs/ subfolder assets (e.g. accessibility before/after shots).
