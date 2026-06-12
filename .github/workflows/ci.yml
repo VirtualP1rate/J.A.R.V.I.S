@@ -1,10 +1,10 @@
 name: CI
 
-# Runs on the self-hosted Forgejo (git.1504.ca) runner. The Python jobs run
-# inside an official python container because actions/setup-python cannot
-# provision its GitHub-hosted tool-cache builds here (it failed within
-# seconds on every run); checkout v4 and setup-node v4 are known-good on
-# this runner, so the node job keeps them.
+# Runs on the self-hosted Forgejo (git.1504.ca) runner. The Python jobs
+# bootstrap python3 inside the ubuntu-latest label image via apt because
+# neither actions/setup-python (GitHub-hosted tool cache) nor job-level
+# `container:` images work on this runner; checkout v4 and setup-node v4
+# are known-good here, so the node job keeps them.
 
 on:
   push:
@@ -24,13 +24,21 @@ jobs:
   python-syntax:
     name: Python syntax (compileall)
     runs-on: ubuntu-latest
-    container: python:3.12-bookworm
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           persist-credentials: false
       # Byte-compile sources — catches syntax errors without installing deps.
-      - run: python -m compileall -q app.py core routes src services scripts tests
+      - name: compileall
+        run: |
+          set -e
+          command -v sudo >/dev/null 2>&1 && SUDO=sudo || SUDO=
+          if ! command -v python3 >/dev/null 2>&1; then
+            $SUDO apt-get update -qq
+            $SUDO apt-get install -y -qq python3 >/dev/null
+          fi
+          python3 --version
+          python3 -m compileall -q app.py core routes src services scripts tests
 
   node-syntax:
     name: JS syntax (node --check)
@@ -53,7 +61,6 @@ jobs:
   python-tests:
     name: Python tests (pytest)
     runs-on: ubuntu-latest
-    container: python:3.12-bookworm
     # Informational for now: the suite has known flaky / environment-dependent
     # failures (test isolation + embedding-model assertions). Tracked under the
     # ROADMAP "fresh install smoke tests" item; make this required once green.
@@ -87,9 +94,18 @@ jobs:
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - run: pip install -r requirements.txt
+      - name: Install python + deps, run pytest
         if: steps.docs-check.outputs.docs_only != 'true'
-      - run: mkdir -p data  # sqlite DB lives at ./data/app.db
-        if: steps.docs-check.outputs.docs_only != 'true'
-      - run: python -m pytest -q
-        if: steps.docs-check.outputs.docs_only != 'true'
+        run: |
+          set -e
+          command -v sudo >/dev/null 2>&1 && SUDO=sudo || SUDO=
+          if ! command -v python3 >/dev/null 2>&1 || ! python3 -m venv --help >/dev/null 2>&1; then
+            $SUDO apt-get update -qq
+            $SUDO apt-get install -y -qq python3 python3-venv python3-pip >/dev/null
+          fi
+          python3 --version
+          # venv sidesteps PEP 668 (externally-managed-environment) on Debian/Ubuntu.
+          python3 -m venv .venv
+          .venv/bin/pip install -q -r requirements.txt
+          mkdir -p data  # sqlite DB lives at ./data/app.db
+          .venv/bin/python -m pytest -q
