@@ -2462,7 +2462,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                   newBody.appendChild(spinner.createElement());
                   spinner.start();
                 }
-                if (streamingTTS) window.aiTTSManager._streamSentencesSent = 0;
+                if (streamingTTS) window.aiTTSManager.streamingRoundReset();
                 uiModule.scrollHistory();
               } else if (json.type === 'budget_exceeded') {
                 if (_isBg) continue;
@@ -2494,6 +2494,9 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 roundText = '';
                 roundFinalized = false;
                 currentToolBubble = null;
+                // The TTS spoken-offset counter indexes into roundText — reset
+                // it with the text or the teacher's reply gets mis-offset.
+                if (streamingTTS) window.aiTTSManager.streamingRoundReset();
                 uiModule.scrollHistory();
 
               } else if (json.type === 'skill_saved') {
@@ -2742,8 +2745,11 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
               ttsBtn.title = 'Read aloud';
             };
             if (streamingTTS) {
-              // Flush remaining partial sentence and attach the real button
-              window.aiTTSManager.streamingEnd(accumulated);
+              // Flush remaining partial sentence and attach the real button.
+              // Per-round text, NOT the multi-round `accumulated` — the spoken
+              // offset counter tracks roundText (streamingUpdate above), so
+              // flushing `accumulated` re-spoke every earlier agent round.
+              window.aiTTSManager.streamingEnd(roundText);
               window.aiTTSManager.streamingAttachButton(ttsBtn, resetFn);
               // If still playing sentences from the stream, show stop icon
               if (window.aiTTSManager.isPlaying || window.aiTTSManager._processing) {

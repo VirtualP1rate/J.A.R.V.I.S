@@ -30,6 +30,7 @@ class AITTSManager {
 
         // Streaming sentence-by-sentence TTS state
         this._streamSentencesSent = 0;  // chars of plain text already queued
+        this._streamLatestText = '';    // newest snapshot for the debounce timer
         this._streamActive = false;
         this._streamButton = null;
         this._streamResetFn = null;
@@ -327,6 +328,7 @@ class AITTSManager {
             this._streamDebounceTimer = null;
         }
         this._streamSentencesSent = 0;
+        this._streamLatestText = '';
 
         // Clear the entire queue and reset all queued buttons
         for (const item of this._queue) {
@@ -610,20 +612,41 @@ class AITTSManager {
 
     streamingStart() {
         this._streamSentencesSent = 0;
+        this._streamLatestText = '';
         this._streamActive = true;
         this._streamButton = null;
         this._streamResetFn = null;
         this._streamFirstEmitted = false; // first spoken chunk may break on a clause
     }
 
+    /**
+     * A new agent round (or teacher takeover) restarts the per-round text the
+     * caller feeds streamingUpdate — drop the spoken-offset counter and any
+     * pending debounce snapshot so offsets never index into the wrong text.
+     * Without this, the end-of-stream flush re-spoke earlier rounds.
+     */
+    streamingRoundReset() {
+        this._streamSentencesSent = 0;
+        this._streamLatestText = '';
+        if (this._streamDebounceTimer) {
+            clearTimeout(this._streamDebounceTimer);
+            this._streamDebounceTimer = null;
+        }
+    }
+
     streamingUpdate(accumulatedText) {
         if (!this._streamActive || !this.available || !this.autoPlay) return;
+        // Always record the newest snapshot — the debounce timer processes
+        // this field, so a sentence boundary that arrives mid-window is
+        // synthesized when the timer fires instead of waiting for the next
+        // delta (which could be 60-120ms later, or never on stream end).
+        this._streamLatestText = accumulatedText;
         if (this._streamDebounceTimer) return;
         // Short debounce so the first phrase reaches synthesis fast — this is
         // part of the time-to-first-audio budget in conversation mode.
         this._streamDebounceTimer = setTimeout(() => {
             this._streamDebounceTimer = null;
-            this._processStreamingSentences(accumulatedText);
+            this._processStreamingSentences(this._streamLatestText);
         }, 60);
     }
 

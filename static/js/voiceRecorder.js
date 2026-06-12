@@ -71,7 +71,11 @@ function formatTime(seconds) {
  * Reset UI state after recording ends
  */
 function _resetRecordingUI() {
-  isRecording = false;
+  // Conversation mode can re-arm a NEW recorder before this (async) reset
+  // runs for the old one — don't mark the live recording as stopped.
+  if (!mediaRecorder || mediaRecorder.state !== 'recording') {
+    isRecording = false;
+  }
   if (recordingInterval) {
     clearInterval(recordingInterval);
     recordingInterval = null;
@@ -80,7 +84,14 @@ function _resetRecordingUI() {
   const sendBtn = document.querySelector('.send-btn');
   if (sendBtn) {
     sendBtn.classList.remove('recording');
-    sendBtn.dataset.mode = '';
+    // Only clear OUR state. In conversation mode the auto-submitted
+    // transcript has often already set mode='streaming' (chat.js), which
+    // voiceConversation._isStreaming() relies on — wiping it blinded the
+    // loop's stream detection and let the next utterance abort the
+    // in-flight response.
+    if (sendBtn.dataset.mode === 'recording') {
+      sendBtn.dataset.mode = '';
+    }
   }
   if (window._updateSendBtnIcon) {
     setTimeout(window._updateSendBtnIcon, 50);
@@ -347,6 +358,10 @@ export function startRecording(onFileCreated, showToast, showError, opts = {}) {
 
       const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
         console.log('[rec] captured blob:', audioBlob.size, 'bytes from', audioChunks.length, 'chunks');
+        // Reset the recording UI BEFORE delivering the transcript:
+        // deliver() synchronously reaches handleChatSubmit, which sets
+        // mode='streaming' — resetting afterwards clobbered that state.
+        _resetRecordingUI();
         const provider = _sttProvider;
         // Hands-free conversation mode routes the transcript to a callback
         // instead of dropping it in the composer for the user to send.
@@ -398,8 +413,6 @@ export function startRecording(onFileCreated, showToast, showError, opts = {}) {
           const audioFile = new File([audioBlob], `voice-message-${Date.now()}.webm`, { type: 'audio/webm' });
           if (onFileCreated) onFileCreated(audioFile);
         }
-
-        _resetRecordingUI();
       };
 
       mediaRecorder.start();
