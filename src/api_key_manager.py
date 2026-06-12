@@ -4,6 +4,8 @@ import logging
 from typing import Dict
 from cryptography.fernet import Fernet, InvalidToken
 
+from core.platform_compat import safe_chmod
+
 logger = logging.getLogger(__name__)
 
 class APIKeyManager:
@@ -13,14 +15,22 @@ class APIKeyManager:
         self.key_file = os.path.join(data_dir, ".key")
         
     def get_or_create_key(self) -> bytes:
-        """Get or create encryption key for API keys"""
+        """Get or create encryption key for API keys.
+
+        The key file is locked to 0o600 — it decrypts every stored provider
+        key, so default umask permissions (world-readable on the bind-mounted
+        data dir) defeat the at-rest encryption. Existing files are re-chmod'd
+        too, repairing deployments created before this fix. Mirrors the
+        invariant used for data/.app_key (secret_storage.py)."""
         if os.path.exists(self.key_file):
+            safe_chmod(self.key_file, 0o600)
             with open(self.key_file, 'rb') as f:
                 return f.read()
         else:
             key = Fernet.generate_key()
             with open(self.key_file, 'wb') as f:
                 f.write(key)
+            safe_chmod(self.key_file, 0o600)
             return key
     
     def encrypt_api_key(self, api_key: str) -> str:
@@ -71,6 +81,7 @@ class APIKeyManager:
         keys[provider] = self.encrypt_api_key(api_key)
         with open(self.api_keys_file, 'w', encoding="utf-8") as f:
             json.dump(keys, f)
+        safe_chmod(self.api_keys_file, 0o600)
 
     def load(self) -> Dict[str, str]:
         """Load and decrypt API keys"""

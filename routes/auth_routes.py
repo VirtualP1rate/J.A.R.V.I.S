@@ -8,7 +8,7 @@ import logging
 import os
 
 from core.auth import AuthManager
-from src.rate_limiter import RateLimiter
+from src.rate_limiter import RateLimiter, client_key
 from src.settings_scrub import scrub_settings
 from src.settings import (
     load_settings as _load_settings,
@@ -87,7 +87,7 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
     @router.post("/setup")
     async def first_run_setup(body: SetupRequest, request: Request):
         """Create initial admin account. Only works if no accounts exist."""
-        if not _setup_limiter.check(request.client.host):
+        if not _setup_limiter.check(client_key(request)):
             raise HTTPException(429, "Too many requests — try again later")
         if auth_manager.is_configured:
             raise HTTPException(400, "Already configured")
@@ -101,7 +101,7 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
     @router.post("/signup")
     async def signup(body: SignupRequest, request: Request):
         """Create a new user account. Only works if signup is enabled by admin."""
-        if not _signup_limiter.check(request.client.host):
+        if not _signup_limiter.check(client_key(request)):
             raise HTTPException(429, "Too many requests — try again later")
         if not auth_manager.is_configured:
             raise HTTPException(400, "Run setup first")
@@ -118,7 +118,7 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
 
     @router.post("/login")
     async def login(body: LoginRequest, request: Request, response: Response):
-        if not _login_limiter.check(request.client.host):
+        if not _login_limiter.check(client_key(request)):
             raise HTTPException(429, "Too many requests — try again later")
         # Verify password first
         username = body.username.strip().lower()
@@ -417,16 +417,29 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
 
     # ---- App settings (admin-managed) ----
 
+    # The pre-login boot JS calls /settings while unauthenticated (the route
+    # is AUTH_EXEMPT) for display prefs only. Name-based scrubbing leaked the
+    # owner's email, ntfy topic, filesystem hints, and endpoint topology to
+    # anonymous callers — so anonymous gets ONLY this whitelist. Keys the
+    # known pre-login consumers read: tts-ai.js / app.js (tts_*), stt UI,
+    # keyboard-shortcuts.js (keybinds), search.js (search_provider).
+    _ANON_SETTINGS_WHITELIST = (
+        "tts_enabled", "tts_provider", "tts_voice", "tts_speed",
+        "stt_provider", "keybinds", "search_provider", "image_gen_enabled",
+    )
+
     @router.get("/settings")
     async def get_settings(request: Request):
-        """Returns app settings. Admins get the full set; non-admins get
-        a scrubbed copy with secret keys blanked. The frontend uses this
-        for keybinds + TTS prefs, so it stays callable without admin."""
+        """Returns app settings. Admins get the full set; authenticated
+        non-admins get a scrubbed copy with secret keys blanked; anonymous
+        callers get only the display-pref whitelist the login/boot UI needs."""
         user = _get_current_user(request)
         settings = _load_settings()
         if user and auth_manager.is_admin(user):
             return settings
-        return scrub_settings(settings)
+        if user:
+            return scrub_settings(settings)
+        return {k: settings[k] for k in _ANON_SETTINGS_WHITELIST if k in settings}
 
     @router.post("/settings")
     async def set_settings(request: Request):
