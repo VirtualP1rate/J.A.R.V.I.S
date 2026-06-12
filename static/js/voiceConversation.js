@@ -120,6 +120,9 @@ export async function start() {
         _bargeStream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
         });
+        const bt = _bargeStream.getAudioTracks()[0];
+        console.log('[barge] monitor mic ready:',
+          bt ? JSON.stringify((bt.getSettings && bt.getSettings()) || {}) : '?');
       } catch (e) {
         console.warn('[convo] barge-in mic unavailable:', e && e.name);
         _bargeStream = null;
@@ -288,10 +291,20 @@ function _startBarge() {
     src.connect(analyser);
     const buf = new Uint8Array(analyser.fftSize);
 
-    const threshold = 0.045;  // higher than VAD — must be clearly the user
-    const sustainMs = 300;
+    // The trigger threshold is CALIBRATED, not fixed: for the first 700ms we
+    // sample what this echo-cancelled stream hears while J.A.R.V.I.S speaks
+    // (residual echo + room noise) and set the trigger above that floor. A
+    // fixed 0.045 never fired on quiet mics — real speech peaked at ~0.02.
+    const sustainMs = 350;    // voiced run required to count as a barge-in
+    const dipMs = 150;        // inter-word dips shorter than this don't reset
+    const MIN_THR = 0.012;    // never trigger below ~2.4x the VAD threshold
+    const t0 = performance.now();
+    let calPeak = 0;
+    let threshold = 0;
     let voiceStart = 0;
+    let lastAbove = 0;
     let raf = 0;
+    let _peak = 0, _logT = t0;
 
     const tick = () => {
       analyser.getByteTimeDomainData(buf);
@@ -299,11 +312,30 @@ function _startBarge() {
       for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v; }
       const rms = Math.sqrt(sum / buf.length);
       const now = performance.now();
+
+      if (rms > _peak) _peak = rms;
+      if (now - _logT >= 1000) {
+        console.log('[barge] level peak=' + _peak.toFixed(4) + ' thr=' + (threshold || 0).toFixed(4) + ' calibrating=' + (threshold === 0));
+        _peak = 0; _logT = now;
+      }
+
+      if (now - t0 < 700) {
+        // Calibration window — just record the floor, never trigger.
+        if (rms > calPeak) calPeak = rms;
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+      if (threshold === 0) {
+        threshold = Math.max(MIN_THR, calPeak * 2.5);
+        console.log('[barge] calibrated thr=' + threshold.toFixed(4) + ' (floor peak=' + calPeak.toFixed(4) + ')');
+      }
+
       if (rms > threshold) {
         if (!voiceStart) voiceStart = now;
-        else if (now - voiceStart >= sustainMs) { _onBargeIn(); return; }
-      } else {
-        voiceStart = 0;
+        lastAbove = now;
+        if (now - voiceStart >= sustainMs) { console.log('[barge] triggered'); _onBargeIn(); return; }
+      } else if (voiceStart && now - lastAbove > dipMs) {
+        voiceStart = 0; // sustained drop — not speech, reset the run
       }
       raf = requestAnimationFrame(tick);
     };
