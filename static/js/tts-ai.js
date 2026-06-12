@@ -92,15 +92,21 @@ class AITTSManager {
             // A stray orphan closing tag with no opener.
             .replace(/<\/think(?:ing)?>/gi, '');
 
-        // Create a temporary div to parse HTML/markdown
-        const temp = document.createElement('div');
-        temp.innerHTML = cleaned;
+        // Parse into an INERT <template> to flatten HTML to text. A regular
+        // div executes side-effectful markup on innerHTML assignment —
+        // <img src=x onerror=...> fires without the node ever being appended,
+        // and this sink receives the RAW model stream (attacker-influenceable
+        // via RAG docs, web results, summarized emails) on every read-aloud
+        // and continuously during voice mode. Template content never loads
+        // resources or runs handlers — same pattern markdown.js uses.
+        const tpl = document.createElement('template');
+        tpl.innerHTML = cleaned;
 
         // Remove code blocks
-        temp.querySelectorAll('pre, code').forEach(el => el.remove());
+        tpl.content.querySelectorAll('pre, code').forEach(el => el.remove());
 
         // Get text content
-        let text = temp.textContent || temp.innerText || '';
+        let text = tpl.content.textContent || '';
 
         // Clean up markdown syntax
         text = text
