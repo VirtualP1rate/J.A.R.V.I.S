@@ -237,9 +237,13 @@ async def preprocess(
 
 def add_user_message(sess, chat_handler, preprocessed: PreprocessedMessage, incognito: bool = False):
     """Add user message to session history and update session name.
-    In incognito mode, still add to in-memory history (for conversation context)
-    but skip session name update (which would persist)."""
+    In incognito mode the message stays in-memory only: the incognito
+    metadata flag makes the session manager skip the DB write (the single
+    enforcement point — see _persist_message), and the session-name update
+    is skipped because it persists too."""
     user_meta = {"attachments": preprocessed.attachment_meta} if preprocessed.attachment_meta else None
+    if incognito:
+        user_meta = {**(user_meta or {}), "incognito": True}
     sess.add_message(ChatMessage("user", preprocessed.user_content, metadata=user_meta))
     if not incognito:
         chat_handler.update_session_name_if_needed(sess, preprocessed.text_for_context)
@@ -794,6 +798,10 @@ def save_assistant_response(
         md["research_clarification"] = True
     if tool_events:
         md["tool_events"] = tool_events
+    if incognito:
+        # The session manager's _persist_message skips messages carrying this
+        # flag — the reply stays in-memory for context but is never written.
+        md["incognito"] = True
 
     # Extract thinking into metadata (don't pollute message content with <think> tags)
     _think_info = _extract_thinking_meta(full_response)
@@ -917,6 +925,7 @@ def run_post_response_tasks(
             "user_message": message, "response": full_response[:2000],
         }))
 
-    # Auto-name
-    if needs_auto_name(sess.name):
+    # Auto-name. Never for incognito turns: the generated title derives from
+    # (and persists a digest of) content the user was promised is not saved.
+    if not incognito and needs_auto_name(sess.name):
         asyncio.create_task(auto_name_session(session_manager, sess))

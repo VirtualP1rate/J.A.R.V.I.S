@@ -199,7 +199,17 @@ class SessionManager:
         self._persist_message(session_id, message)
 
     def _persist_message(self, session_id: str, message: ChatMessage):
-        """Persist a single message to the database."""
+        """Persist a single message to the database.
+
+        Messages whose metadata carries ``incognito: True`` are NEVER written:
+        the UI promises incognito turns are not saved, and enforcing it here —
+        the single choke point every add_message path funnels through — means
+        no route-level caller can leak one by forgetting a gate (tracker #2).
+        They still live in the in-memory session.history for conversation
+        context until the session is reloaded.
+        """
+        if (message.metadata or {}).get("incognito"):
+            return
         db = SessionLocal()
         try:
             db_session = db.query(DbSession).filter(DbSession.id == session_id).first()
@@ -301,7 +311,13 @@ class SessionManager:
         try:
             db.query(DbChatMessage).filter(DbChatMessage.session_id == session_id).delete()
             now = datetime.now(timezone.utc)
-            for i, message in enumerate(messages):
+            # Same no-retention rule as _persist_message: incognito-flagged
+            # messages stay in the in-memory history (set below) but are never
+            # written — without this, a compaction of a session that has had
+            # incognito turns would bulk-persist them through this path.
+            persisted = [m for m in messages
+                         if not (getattr(m, "metadata", None) or {}).get("incognito")]
+            for i, message in enumerate(persisted):
                 msg_id = str(uuid.uuid4())
                 db_message = DbChatMessage(
                     id=msg_id,
@@ -326,7 +342,7 @@ class SessionManager:
 
             db_session = db.query(DbSession).filter(DbSession.id == session_id).first()
             if db_session:
-                db_session.message_count = len(messages)
+                db_session.message_count = len(persisted)
                 db_session.updated_at = now
                 db_session.last_accessed = now
                 db_session.last_message_at = now
