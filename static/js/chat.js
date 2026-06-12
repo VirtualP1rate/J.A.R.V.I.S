@@ -2734,7 +2734,11 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
         }
         // TTS auto-play: streaming mode flushes remaining text, non-streaming enqueues full message
         if (accumulated && window.aiTTSManager && window.aiTTSManager.autoPlay) {
-          const ttsBtn = holder.querySelector('.ai-tts-button');
+          // The button was added to footerTarget (the last visible bubble) —
+          // on a multi-round agent reply that is roundHolder, NOT holder.
+          // Querying holder found nothing, skipped streamingEnd, and left
+          // _streamActive set — wedging conversation mode in "speaking".
+          const ttsBtn = footerTarget.querySelector('.ai-tts-button');
           if (ttsBtn) {
             var ICON_PLAY_TTS = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="6 3 20 12 6 21 6 3"/></svg>';
             var ICON_STOP_TTS = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>';
@@ -2982,6 +2986,14 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
         }
       }
     } finally {
+      // Close the streaming-TTS session on EVERY exit — success, error, or
+      // abort. The happy path flushes via streamingEnd above (idempotent:
+      // _streamActive gates re-entry); error/abort paths never reached it,
+      // leaving _streamActive set, which reads as "TTS busy" forever and
+      // wedges conversation mode in "speaking".
+      if (streamingTTS && window.aiTTSManager && window.aiTTSManager._streamActive) {
+        try { window.aiTTSManager.streamingEnd(roundText); } catch (_e) { /* ignore */ }
+      }
       clearResponseTimeout();
       clearProcessingProbe();
       // Streaming done — let screen readers announce the settled response.

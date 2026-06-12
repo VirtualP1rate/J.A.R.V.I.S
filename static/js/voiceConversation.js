@@ -199,6 +199,7 @@ function _watchCompletion() {
   if (_watchTimer) clearInterval(_watchTimer);
   let sawActivity = false;
   let idleTicks = 0;       // ticks spent idle before any activity was seen
+  let staleStreamTicks = 0; // ticks where only a leaked _streamActive looks busy
   const MAX_IDLE_TICKS = 40; // ~8s — re-arm even if a stream never registered
   _watchTimer = setInterval(() => {
     if (!_enabled) { clearInterval(_watchTimer); _watchTimer = null; return; }
@@ -209,6 +210,23 @@ function _watchCompletion() {
       if (_ttsBusy() && _state !== STATE.SPEAKING) {
         _setState(STATE.SPEAKING);
         _startBarge();
+      }
+      // Wedge guard: if the ONLY busy signal is an open streaming-TTS
+      // session (_streamActive) with no audio playing, nothing queued, and
+      // the LLM stream finished, the session leaked (an error path skipped
+      // streamingEnd). Close it after ~2s so the loop can re-arm instead of
+      // sitting in "speaking" forever.
+      const t = window.aiTTSManager;
+      const staleOnly = !_isStreaming() && t && t._streamActive &&
+                        !t.isPlaying && !t._processing &&
+                        !(t._queue && t._queue.length > 0);
+      if (staleOnly) {
+        if (++staleStreamTicks >= 10) {
+          console.warn('[convo] streaming-TTS session leaked — force-closing');
+          try { t.streamingEnd(''); } catch (e) { /* ignore */ }
+        }
+      } else {
+        staleStreamTicks = 0;
       }
       return;
     }
