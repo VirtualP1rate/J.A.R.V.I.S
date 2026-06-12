@@ -1091,6 +1091,10 @@ def setup_chat_routes(
                                 "stopped": True,
                                 "model": _actual_model or _answered_by or _requested_model,
                                 "requested_model": _requested_model,
+                                # Flag makes _persist_message skip the DB write
+                                # — a disconnect mid-incognito-turn must not
+                                # save the partial reply either.
+                                **({"incognito": True} if incognito else {}),
                             },
                         )
                         sess.add_message(ChatMessage("assistant", _stopped_content, metadata=_stopped_md))
@@ -1231,6 +1235,9 @@ def setup_chat_routes(
                                     "stopped": True,
                                     "model": _actual_model or _answered_by or _requested_model,
                                     "requested_model": _requested_model,
+                                    # Same no-retention rule as the chat-mode
+                                    # disconnect path above.
+                                    **({"incognito": True} if incognito else {}),
                                 },
                             )
                             sess.add_message(ChatMessage("assistant", _stopped_content2, metadata=_stopped_md2))
