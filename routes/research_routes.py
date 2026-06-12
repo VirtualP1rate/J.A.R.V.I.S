@@ -164,11 +164,16 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
     async def research_status(session_id: str, request: Request):
         user = _require_user(request)
         _validate_session_id(session_id)
+        # 200 {"status": "none"}, not 404: "no research" is the normal answer
+        # for this status poll (every page load asks) and browsers log 4xx to
+        # the console as errors. Unowned and nonexistent sessions return the
+        # SAME body so ownership is still not probeable. Clients key off
+        # status not being "running"/"done".
         if not _owns_in_memory(session_id, user):
-            raise HTTPException(404, "No research found for this session")
+            return {"status": "none"}
         status = research_handler.get_status(session_id)
         if status is None:
-            raise HTTPException(404, "No research found for this session")
+            return {"status": "none"}
         return status
 
     @router.post("/api/research/cancel/{session_id}")
