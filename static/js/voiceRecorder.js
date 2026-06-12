@@ -26,6 +26,14 @@ let _sttProvider = 'disabled';
 // Per-recording options (VAD, transcript callback). Reset on each start.
 let _opts = {};
 
+// Speculative early transcription (conversation mode): at ~half the VAD
+// silence window we snapshot the audio so far and start Whisper on it, so the
+// decode runs DURING the remaining endpoint wait instead of after it. If the
+// user resumes talking the speculation is discarded.
+let _specPending = false;   // requestData() issued, waiting for the chunk
+let _specPromise = null;    // in-flight speculative transcription (null on error)
+let _specValid = false;     // no speech heard since the speculation started
+
 // Voice Activity Detection state (for hands-free conversation mode). The
 // analyser watches the live mic level and auto-stops the recording after a
 // short trailing silence once speech has been detected.
@@ -220,6 +228,11 @@ function _startVad(stream, opts, onAutoStop) {
     let speechStart = 0;  // when the current above-threshold run began
     let lastVoice = 0;    // last time we were above threshold
     let speaking = false; // sustained speech confirmed
+    // Fire the speculative-transcribe callback partway into the silence
+    // window — late enough that most mid-sentence pauses have passed, early
+    // enough that the decode overlaps the remaining wait.
+    const specMs = Math.max(150, Math.min(silenceMs - 100, silenceMs / 2));
+    let specFired = false;
 
     const fire = (reason) => {
       if (_vadStopped) return;
@@ -241,6 +254,12 @@ function _startVad(stream, opts, onAutoStop) {
       }
       if (rms > threshold) {
         lastVoice = now;
+        if (specFired) {
+          // Speech resumed after a speculation started — it no longer covers
+          // the full utterance; discard it and allow a new one later.
+          specFired = false;
+          if (opts.onSpecInvalid) opts.onSpecInvalid();
+        }
         if (!speaking) {
           if (!speechStart) speechStart = now;
           if (now - speechStart >= minSpeechMs) {
@@ -252,6 +271,10 @@ function _startVad(stream, opts, onAutoStop) {
         speechStart = 0; // partial blip — reset
       }
 
+      if (speaking && !specFired && opts.onSpeculative && (now - lastVoice) >= specMs) {
+        specFired = true;
+        opts.onSpeculative();
+      }
       if (speaking && (now - lastVoice) >= silenceMs) return fire('silence');
       if (now - startedAt >= maxMs) return fire(speaking ? 'maxlen' : 'timeout');
       _vadRaf = requestAnimationFrame(tick);
@@ -312,6 +335,9 @@ export function startRecording(onFileCreated, showToast, showError, opts = {}) {
   }
 
   audioChunks = [];
+  _specPending = false;
+  _specPromise = null;
+  _specValid = false;
 
   const _handleMicError = (error) => {
     _stopVad();
@@ -350,7 +376,32 @@ export function startRecording(onFileCreated, showToast, showError, opts = {}) {
       if (event.data.size > 0) {
         audioChunks.push(event.data);
       }
+      if (_specPending) {
+        // Chunk requested by the speculative path: everything captured so
+        // far forms a decodable webm (the first chunk carries the container
+        // header). Kick off Whisper now — the remaining silence window and
+        // the decode run concurrently.
+        _specPending = false;
+        _specValid = true;
+        const specBlob = new Blob(audioChunks, { type: 'audio/webm' });
+        _specPromise = transcribeOnServer(specBlob).catch(() => null);
+      }
     };
+
+    // Speculative early transcription: only meaningful with VAD endpointing
+    // and a server-side STT provider (browser STT is already incremental).
+    const _serverStt = _sttProvider === 'local' || _sttProvider.startsWith('endpoint:');
+    if (_opts.vad && _serverStt) {
+      _opts.onSpeculative = () => {
+        if (!mediaRecorder || mediaRecorder.state !== 'recording') return;
+        _specPending = true;
+        try { mediaRecorder.requestData(); } catch (e) { _specPending = false; }
+      };
+      _opts.onSpecInvalid = () => {
+        _specPromise = null;
+        _specValid = false;
+      };
+    }
 
     mediaRecorder.onstop = async () => {
       _stopVad();
@@ -387,7 +438,18 @@ export function startRecording(onFileCreated, showToast, showError, opts = {}) {
           // conversation UI shows its own state).
           if (showToast && !onTranscript) showToast('Transcribing...', 5000);
           try {
-            const transcript = await transcribeOnServer(audioBlob);
+            let transcript = null;
+            if (_specPromise && _specValid) {
+              // The speculative decode covers the whole utterance (only
+              // silence followed it) and has been running since mid-window.
+              transcript = await _specPromise;
+              console.log('[stt] speculative transcript', transcript === null ? 'failed - falling back' : 'used');
+            }
+            _specPromise = null;
+            _specValid = false;
+            if (transcript === null || transcript === undefined) {
+              transcript = await transcribeOnServer(audioBlob);
+            }
             if (transcript) {
               deliver(transcript);
             } else if (onTranscript) {

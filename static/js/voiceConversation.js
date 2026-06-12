@@ -30,6 +30,7 @@ let _watchTimer = null;     // polls for stream/TTS completion to re-arm
 let _barge = null;          // active barge-in monitor { stop() }
 let _prevAutoPlay = false;   // restore TTS autoplay on exit
 let _stream = null;          // persistent mic stream, reused across all turns
+let _bargeStream = null;     // separate echo-cancelled mic stream for barge-in
 
 // Latency tuning. The endpointing silence is the single biggest knob for
 // perceived responsiveness — how long after you stop talking before J.A.R.V.I.S
@@ -42,9 +43,12 @@ const VAD_TUNING = {
 };
 
 // Barge-in (interrupting J.A.R.V.I.S by talking over it) needs echo
-// cancellation to avoid the mic hearing the TTS and cutting it off. With raw
-// audio that protection is gone, so keep it off until the core loop is solid.
-const BARGE_ENABLED = false;
+// cancellation so the mic doesn't hear the TTS and cut it off — but the VAD
+// stream must stay RAW (AEC/AGC break silence endpointing). So the barge
+// monitor runs on its own echo-cancelled stream (_bargeStream), acquired in
+// start(); if that acquisition fails, barge-in is silently disabled and the
+// loop works exactly as before.
+const BARGE_ENABLED = true;
 
 // Injected by app.js — see configure().
 let _ui = {
@@ -107,6 +111,20 @@ export async function start() {
     });
     const tr = _stream.getAudioTracks()[0];
     if (tr) console.log('[convo] mic:', tr.label, JSON.stringify(tr.getSettings ? tr.getSettings() : {}));
+    // Second, echo-cancelled stream for the barge-in monitor: AEC removes
+    // J.A.R.V.I.S's own TTS from this capture so talking over it is
+    // distinguishable from it hearing itself. AGC stays off so the barge
+    // threshold stays meaningful. Optional — failure just disables barge-in.
+    if (BARGE_ENABLED) {
+      try {
+        _bargeStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
+        });
+      } catch (e) {
+        console.warn('[convo] barge-in mic unavailable:', e && e.name);
+        _bargeStream = null;
+      }
+    }
   } catch (e) {
     if (_ui.showError) {
       _ui.showError(e && e.name === 'NotAllowedError'
@@ -138,6 +156,10 @@ export function stop() {
   if (_stream) {
     _stream.getTracks().forEach(t => t.stop());
     _stream = null;
+  }
+  if (_bargeStream) {
+    _bargeStream.getTracks().forEach(t => t.stop());
+    _bargeStream = null;
   }
   _setState(STATE.OFF);
 }
@@ -246,18 +268,21 @@ function _watchCompletion() {
 //
 // A standalone, analyser-only mic monitor (no MediaRecorder) that runs only
 // while J.A.R.V.I.S is speaking. Sustained voice above a high threshold means
-// the user has started talking → cut playback and start listening. Echo
-// cancellation (set in voiceRecorder's getUserMedia constraints) keeps the
-// speaker output from tripping this.
+// the user has started talking → cut playback and start listening. It taps
+// _bargeStream — a separate echo-cancelled capture acquired in start() — so
+// the speaker output is removed before the level check (the raw VAD stream
+// would hear the TTS and trip instantly).
 
 function _startBarge() {
-  if (!BARGE_ENABLED || _barge || !_stream) return;
+  // Runs on the dedicated echo-cancelled stream — NOT the raw VAD stream,
+  // which hears the TTS playback and would trip the monitor instantly.
+  if (!BARGE_ENABLED || _barge || !_bargeStream) return;
   try {
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return;
     const ctx = new AC();
     if (ctx.state === 'suspended') ctx.resume();
-    const src = ctx.createMediaStreamSource(_stream);
+    const src = ctx.createMediaStreamSource(_bargeStream);
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 512;
     src.connect(analyser);
