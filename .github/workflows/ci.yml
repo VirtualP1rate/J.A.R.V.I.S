@@ -61,10 +61,8 @@ jobs:
   python-tests:
     name: Python tests (pytest)
     runs-on: ubuntu-latest
-    # Informational for now: the suite has known flaky / environment-dependent
-    # failures (test isolation + embedding-model assertions). Tracked under the
-    # ROADMAP "fresh install smoke tests" item; make this required once green.
-    continue-on-error: true
+    # Required since the orphaned-test cleanup (#44): the suite runs fully
+    # green in clean CI (2,756 tests), so a red run is a real regression.
     steps:
       # Plain shallow checkout. The old job did a fetch-depth-0 clone plus a
       # git-diff "docs-only change" fast path; that step failed instantly on
