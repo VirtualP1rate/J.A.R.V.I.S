@@ -2987,12 +2987,14 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       }
     } finally {
       // Close the streaming-TTS session on EVERY exit — success, error, or
-      // abort. The happy path flushes via streamingEnd above (idempotent:
-      // _streamActive gates re-entry); error/abort paths never reached it,
-      // leaving _streamActive set, which reads as "TTS busy" forever and
-      // wedges conversation mode in "speaking".
-      if (streamingTTS && window.aiTTSManager && window.aiTTSManager._streamActive) {
-        try { window.aiTTSManager.streamingEnd(roundText); } catch (_e) { /* ignore */ }
+      // abort. The happy path flushes the remainder via streamingEnd above
+      // (idempotent: _streamActive gates re-entry); error/abort paths never
+      // reached it, leaving _streamActive set, which reads as "TTS busy"
+      // forever and wedges conversation mode in "speaking". Only manager
+      // state is referenced here — streamingTTS/roundText are declared
+      // inside the try and are not in scope.
+      if (window.aiTTSManager && window.aiTTSManager._streamActive) {
+        try { window.aiTTSManager.streamingEnd(''); } catch (_e) { /* ignore */ }
       }
       clearResponseTimeout();
       clearProcessingProbe();
