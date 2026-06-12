@@ -30,7 +30,6 @@ let _watchTimer = null;     // polls for stream/TTS completion to re-arm
 let _barge = null;          // active barge-in monitor { stop() }
 let _prevAutoPlay = false;   // restore TTS autoplay on exit
 let _stream = null;          // persistent mic stream, reused across all turns
-let _bargeStream = null;     // separate echo-cancelled mic stream for barge-in
 
 // Latency tuning. The endpointing silence is the single biggest knob for
 // perceived responsiveness — how long after you stop talking before J.A.R.V.I.S
@@ -42,12 +41,14 @@ const VAD_TUNING = {
   maxMs: 15000,         // hard cap on a single utterance
 };
 
-// Barge-in (interrupting J.A.R.V.I.S by talking over it) needs echo
-// cancellation so the mic doesn't hear the TTS and cut it off — but the VAD
-// stream must stay RAW (AEC/AGC break silence endpointing). So the barge
-// monitor runs on its own echo-cancelled stream (_bargeStream), acquired in
-// start(); if that acquisition fails, barge-in is silently disabled and the
-// loop works exactly as before.
+// Barge-in (interrupting J.A.R.V.I.S by talking over it) monitors the RAW
+// mic stream and calibrates against what it hears while TTS is playing. An
+// echo-cancelled stream was tried first and failed: Chrome's AEC suppresses
+// the near end during double-talk, crushing the user's voice exactly when
+// they try to interrupt. On a headset the raw mic hears (near) nothing of
+// the TTS, so the trigger sits just above the noise floor; on open speakers
+// the calibration measures the acoustic echo and raises the trigger above
+// it (barging in then requires speaking louder than the echo).
 const BARGE_ENABLED = true;
 
 // Injected by app.js — see configure().
@@ -111,23 +112,6 @@ export async function start() {
     });
     const tr = _stream.getAudioTracks()[0];
     if (tr) console.log('[convo] mic:', tr.label, JSON.stringify(tr.getSettings ? tr.getSettings() : {}));
-    // Second, echo-cancelled stream for the barge-in monitor: AEC removes
-    // J.A.R.V.I.S's own TTS from this capture so talking over it is
-    // distinguishable from it hearing itself. AGC stays off so the barge
-    // threshold stays meaningful. Optional — failure just disables barge-in.
-    if (BARGE_ENABLED) {
-      try {
-        _bargeStream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
-        });
-        const bt = _bargeStream.getAudioTracks()[0];
-        console.log('[barge] monitor mic ready:',
-          bt ? JSON.stringify((bt.getSettings && bt.getSettings()) || {}) : '?');
-      } catch (e) {
-        console.warn('[convo] barge-in mic unavailable:', e && e.name);
-        _bargeStream = null;
-      }
-    }
   } catch (e) {
     if (_ui.showError) {
       _ui.showError(e && e.name === 'NotAllowedError'
@@ -159,10 +143,6 @@ export function stop() {
   if (_stream) {
     _stream.getTracks().forEach(t => t.stop());
     _stream = null;
-  }
-  if (_bargeStream) {
-    _bargeStream.getTracks().forEach(t => t.stop());
-    _bargeStream = null;
   }
   _setState(STATE.OFF);
 }
@@ -277,34 +257,37 @@ function _watchCompletion() {
 // would hear the TTS and trip instantly).
 
 function _startBarge() {
-  // Runs on the dedicated echo-cancelled stream — NOT the raw VAD stream,
-  // which hears the TTS playback and would trip the monitor instantly.
-  if (!BARGE_ENABLED || _barge || !_bargeStream) return;
+  if (!BARGE_ENABLED || _barge || !_stream) return;
   try {
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return;
     const ctx = new AC();
     if (ctx.state === 'suspended') ctx.resume();
-    const src = ctx.createMediaStreamSource(_bargeStream);
+    // Tap an independent clone of the raw mic (same trick as the VAD): one
+    // track feeding two consumers goes silent on the Web Audio side.
+    const tapStream = (typeof _stream.clone === 'function') ? _stream.clone() : _stream;
+    const src = ctx.createMediaStreamSource(tapStream);
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 512;
     src.connect(analyser);
     const buf = new Uint8Array(analyser.fftSize);
 
-    // The trigger threshold is CALIBRATED, not fixed: for the first 700ms we
-    // sample what this echo-cancelled stream hears while J.A.R.V.I.S speaks
-    // (residual echo + room noise) and set the trigger above that floor. A
-    // fixed 0.045 never fired on quiet mics — real speech peaked at ~0.02.
-    const sustainMs = 350;    // voiced run required to count as a barge-in
-    const dipMs = 150;        // inter-word dips shorter than this don't reset
-    const MIN_THR = 0.012;    // never trigger below ~2.4x the VAD threshold
-    const t0 = performance.now();
+    // Calibration: sample the raw mic for 800ms WHILE TTS IS AUDIBLY PLAYING
+    // (gated on isPlaying — an earlier wall-clock window measured pre-audio
+    // silence and learned nothing). On a headset this hears ~the noise floor
+    // → trigger lands just above VAD levels; on speakers it hears the echo
+    // → trigger lands above the echo, degrading gracefully.
+    const sustainMs = 250;     // voiced run required to count as a barge-in
+    const dipMs = 150;         // inter-word dips shorter than this don't reset
+    const MIN_THR = 0.005;     // matches the VAD threshold floor
+    let calMs = 0;             // accumulated calibration time (isPlaying only)
     let calPeak = 0;
+    let lastTick = performance.now();
     let threshold = 0;
     let voiceStart = 0;
     let lastAbove = 0;
     let raf = 0;
-    let _peak = 0, _logT = t0;
+    let _peak = 0, _logT = performance.now();
 
     const tick = () => {
       analyser.getByteTimeDomainData(buf);
@@ -312,22 +295,27 @@ function _startBarge() {
       for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v; }
       const rms = Math.sqrt(sum / buf.length);
       const now = performance.now();
+      const dt = now - lastTick;
+      lastTick = now;
 
       if (rms > _peak) _peak = rms;
       if (now - _logT >= 1000) {
-        console.log('[barge] level peak=' + _peak.toFixed(4) + ' thr=' + (threshold || 0).toFixed(4) + ' calibrating=' + (threshold === 0));
+        console.log('[barge] level peak=' + _peak.toFixed(4) + ' thr=' + (threshold || 0).toFixed(4) + ' calMs=' + (calMs | 0));
         _peak = 0; _logT = now;
       }
 
-      if (now - t0 < 700) {
-        // Calibration window — just record the floor, never trigger.
-        if (rms > calPeak) calPeak = rms;
+      if (threshold === 0) {
+        const tts = window.aiTTSManager;
+        if (tts && tts.isPlaying) {
+          calMs += dt;
+          if (rms > calPeak) calPeak = rms;
+          if (calMs >= 800) {
+            threshold = Math.max(MIN_THR, calPeak * 1.8);
+            console.log('[barge] calibrated thr=' + threshold.toFixed(4) + ' (tts-echo peak=' + calPeak.toFixed(4) + ')');
+          }
+        }
         raf = requestAnimationFrame(tick);
         return;
-      }
-      if (threshold === 0) {
-        threshold = Math.max(MIN_THR, calPeak * 2.5);
-        console.log('[barge] calibrated thr=' + threshold.toFixed(4) + ' (floor peak=' + calPeak.toFixed(4) + ')');
       }
 
       if (rms > threshold) {
@@ -341,14 +329,17 @@ function _startBarge() {
     };
     raf = requestAnimationFrame(tick);
 
-    // Reuse the persistent mic stream — only tear down the analyser/context,
-    // never the shared stream tracks. stop() references `src` so the source
-    // node isn't garbage-collected mid-monitor (which would mute the analyser).
+    // stop() references `src` so the source node isn't garbage-collected
+    // mid-monitor (which would mute the analyser). The cloned tap tracks are
+    // ours to stop; the shared persistent stream is never touched.
     _barge = {
       stop() {
         cancelAnimationFrame(raf);
         try { src.disconnect(); } catch (e) { /* ignore */ }
         try { ctx.close(); } catch (e) { /* ignore */ }
+        if (tapStream !== _stream) {
+          try { tapStream.getTracks().forEach(t => t.stop()); } catch (e) { /* ignore */ }
+        }
       },
     };
   } catch (e) {
