@@ -8,13 +8,13 @@ name: ci / docker publish
 # manifest list and applies the tags (faster + cleaner than QEMU emulation).
 # Registry: ghcr.io/<owner>/<repo>.
 
+# MANUAL ONLY on the self-hosted Forgejo: this pipeline targets GHCR with a
+# GitHub token and an ubuntu-24.04-arm runner, neither of which exists here —
+# it failed on every push to dev. Re-enable the push trigger after pointing
+# REGISTRY/credentials at a reachable registry (e.g. git.1504.ca's container
+# registry) or when the repo moves back to GitHub.
 on:
-  push:
-    branches: [dev, main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '.github/ISSUE_TEMPLATE/**'
+  workflow_dispatch:
 
 concurrency:
   group: docker-publish-${{ github.ref }}
