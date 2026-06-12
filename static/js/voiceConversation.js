@@ -37,7 +37,10 @@ let _stream = null;          // persistent mic stream, reused across all turns
 const VAD_TUNING = {
   vadThreshold: 0.005,  // RMS gate; tuned for raw (un-AGC'd) mic levels
   silenceMs: 500,       // trailing silence that ends a turn
-  minSpeechMs: 100,     // min voiced run to count as speech (rejects clicks)
+  // 150ms: ambient blips (breath, chair, clicks) measure 0.006-0.008 for
+  // ~100ms and were starting phantom turns that transcribed to "" — real
+  // speech (even a bare "Yes.") holds the gate comfortably longer.
+  minSpeechMs: 150,
   maxMs: 15000,         // hard cap on a single utterance
 };
 
@@ -277,9 +280,14 @@ function _startBarge() {
     // silence and learned nothing). On a headset this hears ~the noise floor
     // → trigger lands just above VAD levels; on speakers it hears the echo
     // → trigger lands above the echo, degrading gracefully.
-    const sustainMs = 250;     // voiced run required to count as a barge-in
-    const dipMs = 150;         // inter-word dips shorter than this don't reset
-    const MIN_THR = 0.005;     // matches the VAD threshold floor
+    // Stricter than the VAD on purpose: the VAD only needs to notice that
+    // the user is talking; the barge trigger CUTS OFF a live answer, so a
+    // false positive costs the whole response. Ambient blips on this mic
+    // reach 0.006-0.008 — an intentional interruption speaks over that at
+    // 0.010+ (utterance onsets measure 0.010-0.024 in the VAD logs).
+    const sustainMs = 300;     // voiced run required to count as a barge-in
+    const dipMs = 100;         // inter-word dips shorter than this don't reset
+    const MIN_THR = 0.010;     // well above ambient noise, under speech onsets
     let calMs = 0;             // accumulated calibration time (isPlaying only)
     let calPeak = 0;
     let lastTick = performance.now();
