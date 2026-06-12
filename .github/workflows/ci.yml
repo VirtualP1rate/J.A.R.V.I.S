@@ -1,15 +1,21 @@
 name: CI
 
+# Runs on the self-hosted Forgejo (git.1504.ca) runner. The Python jobs run
+# inside an official python container because actions/setup-python cannot
+# provision its GitHub-hosted tool-cache builds here (it failed within
+# seconds on every run); checkout v4 and setup-node v4 are known-good on
+# this runner, so the node job keeps them.
+
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
 
 # Least privilege: none of the jobs write to the repo.
 permissions:
   contents: read
 
-# Cancel superseded runs on the same ref to save Actions minutes.
+# Cancel superseded runs on the same ref to save runner time.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -18,13 +24,11 @@ jobs:
   python-syntax:
     name: Python syntax (compileall)
     runs-on: ubuntu-latest
+    container: python:3.12-bookworm
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
-        with:
-          python-version: "3.11"
       # Byte-compile sources — catches syntax errors without installing deps.
       - run: python -m compileall -q app.py core routes src services scripts tests
 
@@ -49,6 +53,7 @@ jobs:
   python-tests:
     name: Python tests (pytest)
     runs-on: ubuntu-latest
+    container: python:3.12-bookworm
     # Informational for now: the suite has known flaky / environment-dependent
     # failures (test isolation + embedding-model assertions). Tracked under the
     # ROADMAP "fresh install smoke tests" item; make this required once green.
@@ -64,6 +69,7 @@ jobs:
       - name: Check for docs-only changes
         id: docs-check
         run: |
+          git config --global --add safe.directory "$PWD"
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             BASE="${{ github.event.pull_request.base.sha }}"
             HEAD="${{ github.event.pull_request.head.sha }}"
@@ -81,11 +87,6 @@ jobs:
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
-        if: steps.docs-check.outputs.docs_only != 'true'
-        with:
-          python-version: "3.11"
-          cache: pip
       - run: pip install -r requirements.txt
         if: steps.docs-check.outputs.docs_only != 'true'
       - run: mkdir -p data  # sqlite DB lives at ./data/app.db
