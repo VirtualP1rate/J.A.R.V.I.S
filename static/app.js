@@ -4076,7 +4076,6 @@ function startOdysseusApp() {
 
 
   if (window.hljs) {
-    console.log('Highlighting all code blocks on page load');
     document.querySelectorAll('pre code:not(.hljs)').forEach(block => {
       window.hljs.highlightElement(block);
     });
