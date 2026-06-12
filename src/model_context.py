@@ -73,7 +73,13 @@ def _is_local_endpoint(url: str) -> bool:
         return True
     try:
         host = urlparse(url).hostname or ""
-        return host in _LOCAL_HOSTS or host.startswith(_PRIVATE_PREFIXES)
+        # A single-label hostname (no dots) can't be a public internet host —
+        # it's a docker-compose service name ("llamacpp") or an intranet
+        # shortname, both local deployments whose serving context we must
+        # probe rather than trust the model's trained window.
+        return (host in _LOCAL_HOSTS
+                or host.startswith(_PRIVATE_PREFIXES)
+                or (host != "" and "." not in host))
     except Exception:
         return False
 
@@ -272,10 +278,25 @@ def _query_context_length(endpoint_url: str, model: str) -> int:
             return known
         return DEFAULT_CONTEXT
 
-    # Try llama.cpp /slots endpoint first — reports actual serving context
+    # Try llama.cpp's own endpoints first — they report the ACTUAL serving
+    # context (--ctx-size), which on a local server is usually far below the
+    # model's trained window. Getting this wrong makes the trim/compaction
+    # gates think there is room and the server then 400s mid-conversation.
     if _is_local_endpoint(endpoint_url):
+        base = endpoint_url.split("/v1")[0] if "/v1" in endpoint_url else endpoint_url.rsplit("/", 1)[0]
+        # /props is enabled by default; n_ctx here is the per-slot serving
+        # context. (/slots below needs the opt-in --slots flag and 501s
+        # otherwise, so it cannot be the only probe.)
         try:
-            base = endpoint_url.split("/v1")[0] if "/v1" in endpoint_url else endpoint_url.rsplit("/", 1)[0]
+            r = httpx.get(f"{base}/props", timeout=REQUEST_TIMEOUT)
+            if r.is_success:
+                n_ctx = (r.json().get("default_generation_settings") or {}).get("n_ctx")
+                if isinstance(n_ctx, int) and n_ctx > 0:
+                    logger.info(f"llama.cpp /props reports n_ctx={n_ctx} for {model}")
+                    return n_ctx
+        except Exception:
+            pass
+        try:
             r = httpx.get(f"{base}/slots", timeout=REQUEST_TIMEOUT)
             if r.is_success:
                 slots = r.json()
