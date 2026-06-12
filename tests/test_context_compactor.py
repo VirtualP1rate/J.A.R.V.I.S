@@ -192,3 +192,111 @@ class TestMaybeCompactFourthMessage:
         ]}
         result = self._run(messages)
         assert len(result) == 3 and result[2] is True
+
+
+class TestCompactionHistoryMapping:
+    """Regression for the review finding (tracker #1): auto-compaction computed
+    the history deletion slice with index arithmetic on the REQUEST message
+    list, which also contains per-request preface messages (security policy,
+    memories, RAG, web results) that are not in session.history — so it
+    permanently deleted unsummarized turns. The split must map onto history by
+    re-applying the get_context_messages filter (non-system, non-slash)."""
+
+    def _history(self):
+        from types import SimpleNamespace as NS
+        return [
+            NS(role="system", content="persona", metadata=None),
+            NS(role="user", content="turn 1 user", metadata=None),
+            NS(role="assistant", content="turn 1 reply", metadata=None),
+            NS(role="user", content="/setup something", metadata={"source": "slash"}),
+            NS(role="user", content="turn 2 user", metadata=None),
+            NS(role="assistant", content="turn 2 reply", metadata=None),
+            NS(role="user", content="turn 3 user", metadata=None),
+            NS(role="assistant", content="turn 3 reply", metadata=None),
+            NS(role="user", content="turn 4 user", metadata=None),
+        ]
+
+    def test_preface_messages_do_not_shift_history_deletion(self):
+        from types import SimpleNamespace as NS
+        history = self._history()
+        session = NS(id="s1", history=list(history))
+
+        # Request list = preface (NOT in history) + context messages (history
+        # minus slash chatter) — exactly how build_chat_context composes it.
+        preface = [
+            {"role": "system", "content": "untrusted content policy " * 50},
+            {"role": "user", "content": "[memories] pinned memory blob " * 50},
+            {"role": "user", "content": "[rag] retrieved doc chunk " * 50},
+        ]
+        context_msgs = [
+            {"role": m.role, "content": m.content}
+            for m in history
+            if (m.metadata or {}).get("source") != "slash"
+        ]
+        messages = preface + context_msgs
+
+        orig_ctx = cc.get_context_length
+        orig_call = cc.llm_call_async
+        orig_resolve = cc.resolve_endpoint
+        orig_chatmsg = cc.ChatMessage
+        core_models_mock = sys.modules["core.models"]
+        orig_mgr = getattr(core_models_mock, "_session_manager", None)
+
+        async def _fake_summary(*a, **k):
+            return "summary text"
+
+        cc.get_context_length = lambda url, model: 500
+        cc.llm_call_async = _fake_summary
+        cc.resolve_endpoint = lambda which, owner=None: (None, None, None)
+        cc.ChatMessage = lambda role, content, metadata=None: NS(
+            role=role, content=content, metadata=metadata)
+        core_models_mock._session_manager = None
+        try:
+            compacted, _, was_compacted = asyncio.run(maybe_compact(
+                session=session,
+                endpoint_url="http://local/v1/chat/completions",
+                model="local-model",
+                messages=list(messages),
+                headers={},
+                preface_count=len(preface),
+            ))
+        finally:
+            cc.get_context_length = orig_ctx
+            cc.llm_call_async = orig_call
+            cc.resolve_endpoint = orig_resolve
+            cc.ChatMessage = orig_chatmsg
+            core_models_mock._session_manager = orig_mgr
+
+        assert was_compacted is True
+        # History has 7 context-visible convo messages -> split_point 3:
+        # "turn 1 user", "turn 1 reply", "turn 2 user" are summarized.
+        contents = [str(getattr(m, "content", "")) for m in session.history]
+        assert "turn 1 user" not in contents
+        assert "turn 1 reply" not in contents
+        assert "turn 2 user" not in contents
+        # Everything after the summarized block survives. Before the fix, the
+        # preface shifted the slice and these were silently destroyed.
+        assert "turn 2 reply" in contents
+        assert "turn 3 user" in contents
+        assert "turn 3 reply" in contents
+        assert "turn 4 user" in contents
+        # Leading system message and slash chatter are untouched.
+        assert "persona" in contents
+        assert "/setup something" in contents
+        assert any("[Conversation summary]" in c for c in contents)
+        # The returned request list keeps the preface in front, then the
+        # history-side system messages and the summary.
+        assert compacted[0]["content"].startswith("untrusted content policy")
+        assert any("[Conversation summary" in str(m.get("content", "")) for m in compacted)
+
+    def test_history_shorter_than_split_leaves_history_untouched(self):
+        from types import SimpleNamespace as NS
+        # Pathological mismatch: request claims more convo messages than the
+        # session holds. Deleting on a mismatch is the original bug — the
+        # safe behavior is to leave history alone.
+        session = NS(id="s2", history=[
+            NS(role="user", content="only turn", metadata=None),
+        ])
+        cc._update_session_history(session, split_point=5, summary="s")
+        assert len(session.history) == 1
+        assert session.history[0].content == "only turn"

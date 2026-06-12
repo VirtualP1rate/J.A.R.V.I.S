@@ -41,7 +41,7 @@ def test_model_context_queries_models_for_v1_base(monkeypatch):
     def fake_get(url, timeout=None):
         seen.append(url)
         request = httpx.Request("GET", url)
-        if url.endswith("/slots"):
+        if url.endswith("/props") or url.endswith("/slots"):
             return httpx.Response(404, request=request)
         return httpx.Response(
             200,
@@ -53,6 +53,32 @@ def test_model_context_queries_models_for_v1_base(monkeypatch):
 
     assert model_context._query_context_length("http://127.0.0.1:8080/v1", "qwen3") == 32768
     assert seen == [
+        "http://127.0.0.1:8080/props",
         "http://127.0.0.1:8080/slots",
         "http://127.0.0.1:8080/v1/models",
     ]
+
+
+def test_model_context_prefers_props_serving_ctx(monkeypatch):
+    """llama.cpp /props reports the ACTUAL --ctx-size; it must win over the
+    model's known/trained window so trim and compaction gate on reality.
+    Regression: a gemma-4 GGUF served at 8192 was treated as 262144 because
+    /slots (which needs the opt-in --slots flag) 501'd and /v1/models has no
+    n_ctx — the request then 400'd at the server mid-conversation."""
+    monkeypatch.setattr(endpoint_resolver, "resolve_url", lambda url: url)
+
+    def fake_get(url, timeout=None):
+        request = httpx.Request("GET", url)
+        if url.endswith("/props"):
+            return httpx.Response(
+                200,
+                json={"default_generation_settings": {"n_ctx": 8192}},
+                request=request,
+            )
+        return httpx.Response(501, request=request)
+
+    monkeypatch.setattr(model_context.httpx, "get", fake_get)
+
+    assert model_context._query_context_length(
+        "http://llamacpp:8888/v1", "google_gemma-4-26B-A4B-it-IQ4_XS.gguf"
+    ) == 8192

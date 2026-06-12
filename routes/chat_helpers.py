@@ -619,9 +619,12 @@ async def build_chat_context(
     # Build messages
     messages = preface + sess.get_context_messages()
 
-    # Auto-compact
+    # Auto-compact. preface_count tells the compactor which leading messages
+    # are per-request preface (not in session.history) so the history
+    # deletion maps to the right messages.
     messages, context_length, was_compacted = await maybe_compact(
         sess, sess.endpoint_url, sess.model, messages, sess.headers, owner=user,
+        preface_count=len(preface),
     )
     messages = trim_for_context(messages, context_length)
 
