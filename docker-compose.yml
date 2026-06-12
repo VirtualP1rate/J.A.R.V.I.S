@@ -158,10 +158,24 @@ services:
       - "8888"
       - "--n-gpu-layers"
       - "${LLAMA_NGL:-999}"
+      # 16k context with a q8_0-quantized KV cache costs about the same VRAM
+      # as the old 8k fp16 cache (the GPU sits at ~23.7/24.6 GB with whisper +
+      # chatterbox loaded, so there is no headroom for an fp16 16k cache).
+      # q8_0 KV is community-consensus lossless for chat; V-cache quantization
+      # requires flash attention, hence --flash-attn on.
       - "--ctx-size"
-      - "${LLAMA_CTX:-8192}"
+      - "${LLAMA_CTX:-16384}"
+      - "--cache-type-k"
+      - "${LLAMA_CACHE_TYPE_K:-q8_0}"
+      - "--cache-type-v"
+      - "${LLAMA_CACHE_TYPE_V:-q8_0}"
+      - "--flash-attn"
+      - "${LLAMA_FLASH_ATTN:-on}"
       - "--parallel"
       - "${LLAMA_PARALLEL:-1}"
+      # Expose /slots so J.A.R.V.I.S can read the true serving context
+      # (model_context.py probes /props, then /slots).
+      - "--slots"
       - "--jinja"
       # Reasoning/thinking budget: 0 = no thinking (immediate answer) for snappy
       # voice replies; set LLAMA_REASONING_BUDGET=-1 to re-enable unrestricted.
