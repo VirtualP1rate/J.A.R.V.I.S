@@ -151,23 +151,41 @@ def _to_utc_naive(dt):
     return datetime(dt.year, dt.month, dt.day), True
 
 
-def _find_existing_event(db, pending, uid_val, calendar_id):
-    """Find the event to update for THIS calendar.
+def _find_existing_event(db, pending, uid_val, calendar):
+    """Find the event row to upsert for THIS calendar's sync.
 
-    CalendarEvent.uid is the global primary key, so an unscoped lookup by uid
-    returns whatever row holds that VEVENT uid — including another owner's.
-    The old code then reassigned that row's calendar_id, moving (stealing)
-    another user's event into the syncing calendar whenever the two share a
-    uid (shared/subscribed/public calendars, or two accounts on one server).
-    Scope the lookup to the calendar being synced; a genuine cross-user uid
-    collision then fails the PK insert inside the per-calendar try/except
-    instead of hijacking the row. (import_ics was already fixed this way.)
+    Returns ``(row_or_None, cross_owner_conflict)``.
+
+    CalendarEvent.uid is the GLOBAL primary key. The lookup is scoped to the
+    syncing calendar first — an unscoped uid match must never silently move
+    (steal) another user's event into this calendar (shared/subscribed
+    calendars and two accounts on one server share VEVENT uids). But a
+    scoped miss while the uid exists elsewhere used to fall through to an
+    INSERT that failed the PK constraint and aborted the WHOLE calendar's
+    batch — permanently, every sync cycle (#48). So on a scoped miss the uid
+    is checked globally:
+      - a row under a calendar with the SAME owner is adopted (the caller's
+        update branch reassigns calendar_id — an event moving between your
+        own calendars is normal CalDAV semantics),
+      - a row under ANOTHER owner's calendar reports a conflict so the
+        caller skips just that VEVENT instead of failing the batch.
     """
-    from core.database import CalendarEvent
-    return pending.get(uid_val) or db.query(CalendarEvent).filter(
+    from core.database import CalendarEvent, CalendarCal
+    row = pending.get(uid_val) or db.query(CalendarEvent).filter(
         CalendarEvent.uid == uid_val,
-        CalendarEvent.calendar_id == calendar_id,
+        CalendarEvent.calendar_id == calendar.id,
     ).first()
+    if row is not None:
+        return row, False
+    other = db.query(CalendarEvent).filter(CalendarEvent.uid == uid_val).first()
+    if other is None:
+        return None, False
+    other_owner = db.query(CalendarCal.owner).filter(
+        CalendarCal.id == other.calendar_id
+    ).scalar()
+    if other_owner == calendar.owner:
+        return other, False
+    return None, True
 
 
 def _google_caldav_events_url(url: str) -> str | None:
@@ -393,7 +411,17 @@ def _sync_blocking(owner: str, url: str, username: str, password: str, account_i
                             else ""
                         )
 
-                        existing = _find_existing_event(db, pending, uid_val, local_cal.id)
+                        existing, cross_owner = _find_existing_event(db, pending, uid_val, local_cal)
+                        if cross_owner:
+                            # The uid is taken by another owner's calendar.
+                            # Inserting would fail the global PK and abort
+                            # the whole batch — skip just this VEVENT.
+                            logger.warning(
+                                "CalDAV sync: uid %s already belongs to another "
+                                "owner's calendar — skipping in %s",
+                                uid_val, display_name,
+                            )
+                            continue
                         if existing:
                             existing.calendar_id = local_cal.id
                             existing.summary = summary
