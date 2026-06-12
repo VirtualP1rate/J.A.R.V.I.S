@@ -2057,6 +2057,42 @@ async def stream_agent_loop(
         _tool_names_sent = [t.get("function", {}).get("name") for t in (all_tool_schemas or []) if t.get("function")]
         logger.info(f"[agent-debug] round={round_num} model={model} _is_api_model={_is_api_model} tools_sent={len(_tool_names_sent)} tool_names={_tool_names_sent[:15]} relevant_tools={sorted(_relevant_tools)[:15] if _relevant_tools else 'ALL'}")
 
+        # Mid-loop context guard. The turn-start soft-trim runs once and can't
+        # see the tool results appended each round (e.g. a Home Assistant
+        # api_call returning entity-state JSON), so a fat result used to push
+        # the next round's request past the model window and llama.cpp 400'd
+        # ("request exceeds the available context size"). Re-trim every round
+        # against a window-scaled budget so a large result drops OLD turns
+        # instead of overflowing. trim_for_context early-returns when already
+        # under budget (cheap no-op) and sanitizes any tool_call/tool pairing
+        # it breaks. The min() floor keeps ~15% headroom even if the user set
+        # an explicit budget larger than the window — the headroom absorbs
+        # estimate_tokens' under-count on dense JSON.
+        if context_length and context_length > 0:
+            try:
+                from src.context_compactor import trim_for_context
+                from src.context_budget import compute_input_token_budget, DEFAULT_HEADROOM
+                from src.settings import is_setting_overridden
+                _reserve = min(max(max_tokens or 1024, 512), 2048)
+                _soft = int(get_setting("agent_input_token_budget", 6000) or 0)
+                _budget = min(
+                    compute_input_token_budget(
+                        _soft, context_length,
+                        is_setting_overridden("agent_input_token_budget"),
+                    ),
+                    int(context_length * DEFAULT_HEADROOM),
+                )
+                _before = estimate_tokens(messages)
+                _trimmed = trim_for_context(messages, _budget, reserve_tokens=_reserve)
+                if len(_trimmed) != len(messages):
+                    logger.info(
+                        "[agent-round-%d] mid-loop context trim: %s -> %s tokens (budget=%s)",
+                        round_num, _before, estimate_tokens(_trimmed), _budget,
+                    )
+                    messages = _trimmed
+            except Exception as e:
+                logger.warning("[agent-round-%d] mid-loop trim skipped: %s", round_num, e)
+
         # Primary target + any configured fallback models. stream_llm_with_fallback
         # only switches on a pre-content failure, so streamed output is never
         # duplicated; the dead-host cooldown keeps repeat primary attempts cheap.
